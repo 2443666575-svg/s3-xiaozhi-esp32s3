@@ -1,0 +1,2 @@
+-fno-exceptions -Wall -Werror -DLV_LVGL_H_INCLUDE_SIMPLE
+-DPRINT_HEAP_INFO_INTERVAL=5000

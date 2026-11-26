@@ -1,0 +1,13 @@
+# Name,   Type, SubType, Offset,  Size, Flags
+# ★ 2026-10-31: 为摄像头功能把 app 从 4MB 扩到 6.94MB。
+#   本工程不用文件系统(摄像头照片走 PSRAM, 不落盘)。
+#   ★ spiffs 缩到最小 0x1000(4KB) —— 原来 0xD0000(832KB) 是纯浪费,
+#     ESP32 的 spiffs 分区至少要一个擦除扇区(4KB)才能被分区表工具接受。
+#   ★★ 分区表变了 → 重烧会清掉 NVS(0x9000)里的 WiFi 密码/激活状态, 需重新配网+激活一次。
+#   NVS 起始地址没动(0x9000)。
+#   总占用 0x6F1000 ≈ 6.95MB, 8MB 与 16MB Flash 都安全(本板 N16R8 = 16MB)。
+#   ★ app 必须从 0x10000 开始: Arduino 的烧录命令把 app 固定写到 0x10000。
+nvs,      data, nvs,     0x9000,  0x5000,
+app,      app,  ota_0,   0x10000, 0x6F0000,
+spiffs,   data, spiffs,  0x700000,0x1000,
+coredump, data, coredump,0x701000,0x10000,

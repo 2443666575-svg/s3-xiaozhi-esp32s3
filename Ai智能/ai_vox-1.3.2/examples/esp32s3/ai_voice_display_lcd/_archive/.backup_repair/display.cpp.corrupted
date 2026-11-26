@@ -1,0 +1,691 @@
+#include <esp_log.h>
+#include <esp_timer.h>  // esp_timer_get_time() —— 屏保闲置计时用(替代 Arduino 的 millis)
+
+#include <algorithm>
+#include <cstdio>
+#include <ctime>
+#include <map>
+#include <vector>
+
+#include "esp_lvgl_port.h"
+#include "font_awesome_symbols.h"
+#include "font_emoji.h"
+#include "wallpaper_data.h"
+#include "display.h"
+
+全
+static inline uint32_t NowMs() {
+  return static_cast<uint32_t>(esp_timer_get_time() / 1000);
+}
+
+LV_FONT_DECLARE(font_puhui_16_4);
+LV_FONT_DECLARE(font_awesome_30_4);
+LV_FONT_DECLARE(font_awesome_16_4);
+
+              .mirror_y = mirror_y,
+          },
+      .color_format = LV_COLOR_FORMAT_RGB565,
+      .flags =
+          {
+              .buff_dma = 1,     // 内部 RAM + DMA, 推屏最快
+              .buff_spiram = 0,  // S3 上不能与 buff_dma 同时为 1
+              .sw_rotate = 0,
+              .swap_bytes = 1,
+              .full_refresh = 0,
+              .direct_mode = 0,
+          },
+  };
+
+  display_ = lvgl_port_add_disp(&display_cfg);
+
+  assert(display_ != nullptr);
+  if (display_ == nullptr) {
+    abort();
+    return;
+  }
+
+  if (offset_x != 0 || offset_y != 0) {
+    lv_display_set_offset(display_, offset_x, offset_y);
+  }
+}
+
+Display::~Display() {
+  // TODO:
+}
+
+void Display::Start() {
+  if (kind_ == Kind::kChat) {
+    StartChatUi();
+  } else {
+    StartSensorUi();
+  }
+}
+
+void Display::StartChatUi() {
+  lvgl_port_lock(0);
+
+  // 多 display 场景下必须用 lv_display_get_screen_active 拿当前 display 的 screen,
+  // 不能用全局 lv_screen_active() (会拿到 default display 的 screen)
+  auto screen = lv_display_get_screen_active(display_);
+  lv_obj_set_style_text_font(screen, &font_puhui_16_4, 0);
+  lv_obj_set_style_text_color(screen, current_theme_.text, 0);
+  lv_obj_set_style_bg_color(screen, current_theme_.background, 0);
+  // ★ 必须同时设 bg_opa: LVGL 只设 bg_color 不设 bg_opa 时背景是"透明"(LV_OPA_TRANSP),
+  //   透明区会透到面板默认色 -> 显示成黑底。这是"背景改白不生效"的真正原因。
+  lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);
+
+  /* Container */
+  container_ = lv_obj_create(screen);
+  lv_obj_set_size(container_, LV_HOR_RES, LV_VER_RES);
+  lv_obj_set_flex_flow(container_, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_style_pad_all(container_, 0, 0);
+  lv_obj_set_style_border_width(container_, 0, 0);
+  lv_obj_set_style_pad_row(container_, 0, 0);
+  lv_obj_set_style_bg_color(container_, current_theme_.background, 0);
+  lv_obj_set_style_bg_opa(container_, LV_OPA_COVER, 0);  // ★ 白底必须不透明
+  lv_obj_set_style_border_color(container_, current_theme_.border, 0);
+
+  /* Status bar */
+  status_bar_ = lv_obj_create(container_);
+  lv_obj_set_size(status_bar_, LV_HOR_RES, LV_SIZE_CONTENT);
+  lv_obj_set_style_radius(status_bar_, 0, 0);
+  lv_obj_set_style_bg_color(status_bar_, current_theme_.background, 0);
+  lv_obj_set_style_bg_opa(status_bar_, LV_OPA_COVER, 0);  // ★
+  lv_obj_set_style_text_color(status_bar_, current_theme_.text, 0);
+  // 全白背景下状态栏与聊天区同色, 用 1px 底边线把两者分开
+  lv_obj_set_style_border_side(status_bar_, LV_BORDER_SIDE_BOTTOM, 0);
+  lv_obj_set_style_border_width(status_bar_, 1, 0);
+  lv_obj_set_style_border_color(status_bar_, current_theme_.border, 0);
+  lv_obj_set_style_pad_bottom(status_bar_, 3, 0);
+
+  /* Content - Chat area */
+  content_ = lv_obj_create(container_);
+  lv_obj_set_style_radius(content_, 0, 0);
+  lv_obj_set_width(content_, LV_HOR_RES);
+  lv_obj_set_flex_grow(content_, 1);
+  lv_obj_set_style_pad_all(content_, 10, 0);
+  lv_obj_set_style_bg_color(content_, current_theme_.chat_background, 0);  // Background for chat area
+  lv_obj_set_style_bg_opa(content_, LV_OPA_COVER, 0);                      // ★ 聊天区白底必须不透明
+  lv_obj_set_style_border_color(content_, current_theme_.border, 0);       // Border color for chat area
+  lv_obj_set_style_border_width(content_, 0, 0);                           // 聊天区不需要外框, 避免白底上多一层灰线
+
+  // Enable scrolling for chat content
+  lv_obj_set_scrollbar_mode(content_, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_scroll_dir(content_, LV_DIR_VER);
+
+  // Create a flex container for chat messages
+  lv_obj_set_flex_flow(content_, LV_FLEX_FLOW_COLUMN);
+  lv_obj_set_flex_align(content_, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START, LV_FLEX_ALIGN_START);
+  lv_obj_set_style_pad_row(content_, 10, 0);  // Space between messages
+
+  // We'll create chat messages dynamically in SetChatMessage
+  chat_message_label_ = nullptr;
+
+  /* Status bar */
+  lv_obj_set_flex_flow(status_bar_, LV_FLEX_FLOW_ROW);
+  lv_obj_set_style_pad_all(status_bar_, 0, 0);
+  lv_obj_set_style_border_width(status_bar_, 0, 0);
+  lv_obj_set_style_pad_column(status_bar_, 0, 0);
+  lv_obj_set_style_pad_left(status_bar_, 10, 0);
+  lv_obj_set_style_pad_right(status_bar_, 10, 0);
+  lv_obj_set_style_pad_top(status_bar_, 2, 0);
+  lv_obj_set_style_pad_bottom(status_bar_, 2, 0);
+  lv_obj_set_scrollbar_mode(status_bar_, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_flex_align(status_bar_, LV_FLEX_ALIGN_SPACE_BETWEEN, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+
+  emotion_label_ = lv_label_create(status_bar_);
+  lv_obj_set_style_text_font(emotion_label_, &font_awesome_30_4, 0);
+  lv_obj_set_style_text_color(emotion_label_, current_theme_.text, 0);
+  lv_label_set_text(emotion_label_, FONT_AWESOME_AI_CHIP);
+  lv_obj_set_style_margin_right(emotion_label_, 5, 0);
+
+  notification_label_ = lv_label_create(status_bar_);
+  lv_obj_set_flex_grow(notification_label_, 1);
+  lv_obj_set_style_text_align(notification_label_, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_color(notification_label_, current_theme_.text, 0);
+  lv_label_set_text(notification_label_, "");
+  lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
+
+  status_label_ = lv_label_create(status_bar_);
+  lv_obj_set_flex_grow(status_label_, 1);
+  lv_label_set_long_mode(status_label_, LV_LABEL_LONG_SCROLL_CIRCULAR);
+  lv_obj_set_style_text_align(status_label_, LV_TEXT_ALIGN_CENTER, 0);
+  lv_obj_set_style_text_color(status_label_, current_theme_.text, 0);
+  lv_label_set_text(status_label_, "初始化");
+
+  mute_label_ = lv_label_create(status_bar_);
+  lv_label_set_text(mute_label_, "");
+  lv_obj_set_style_text_font(mute_label_, &font_awesome_16_4, 0);
+  lv_obj_set_style_text_color(mute_label_, current_theme_.text, 0);
+
+  network_label_ = lv_label_create(status_bar_);
+  lv_label_set_text(network_label_, "");
+  lv_obj_set_style_text_font(network_label_, &font_awesome_16_4, 0);
+  lv_obj_set_style_text_color(network_label_, current_theme_.text, 0);
+  lv_obj_set_style_margin_left(network_label_, 5, 0);
+
+  /* ---------- 屏保层 (全屏覆盖, 默认隐藏, 照片背景) ---------- */
+  // 关键点: 直接挂在 screen 上(而不是 container_ 里), 这样它可以盖住状态栏和聊天区,
+  //         且不受 container_ 的 COLUMN flex 布局影响; 后创建 => z-order 在上层。
+  // 尺寸用 width_/height_ 而不是 LV_HOR_RES/LV_VER_RES: 多 display 场景下后者可能
+  // 取到 default display 的尺寸(本项目 main.cpp 就是两块屏), 与本屏不一定一致。
+  screen_saver_ = lv_obj_create(screen);
+  lv_obj_set_size(screen_saver_, width_, height_);
+  lv_obj_set_pos(screen_saver_, 0, 0);
+  lv_obj_set_style_radius(screen_saver_, 0, 0);
+  lv_obj_set_style_pad_all(screen_saver_, 0, 0);
+  lv_obj_set_style_border_width(screen_saver_, 0, 0);
+  // ★ 照片背景: 容器本身透明, 照片作为第一个子对象铺满, 文字浮在照片上
+  lv_obj_set_style_bg_opa(screen_saver_, LV_OPA_TRANSP, 0);
+  // ★★ 屏保容器【不使用 flex 布局】, 所有子对象用绝对定位(lv_obj_align / set_pos)。
+  //   原因: flex 容器里的子对象位置由布局引擎接管, lv_obj_center/set_pos 会被覆盖,
+  //   导致"只想让时钟下移"却把铺满全屏的照片也一起推下去了(照片在 flex 流里一样被排)。
+  //   改成绝对定位后, 照片和面板互不影响, 想动谁就只动谁。
+  lv_obj_clear_flag(screen_saver_, LV_OBJ_FLAG_SCROLLABLE);
+  // 阻止点击穿透(屏保是"最上层遮挡", 不允许用户点到下面的聊天内容)
+  lv_obj_add_flag(screen_saver_, LV_OBJ_FLAG_CLICKABLE);
+  lv_obj_add_flag(screen_saver_, LV_OBJ_FLAG_HIDDEN);  // 默认隐藏, 闲置后才显示
+
+  // 照片铺满整个屏保层, 绝对定位钉在左上角(0,0), 不受任何布局影响
+  lv_obj_t* wallpaper = lv_image_create(screen_saver_);
+  lv_image_set_src(wallpaper, &kWallpaperDsc);
+  lv_obj_set_size(wallpaper, width_, height_);
+  lv_obj_set_pos(wallpaper, 0, 0);  // 钉在 (0,0), 铺满全屏
+
+  // ★ 照片上直接放黑字可能看不清(照片有深色区域), 所以把时钟/日期包进一个
+  //   半透明白色圆角底板里, 用深色文字, 任何照片下都保证可读。
+  //   配色说明: 照片整体偏亮, 原来是"半透明黑底 + 白字";
+  //             现按需求改为"半透明白底 + 黑字"(深色系照片上白底反而更醒目)。
+  lv_obj_t* saver_panel = lv_obj_create(screen_saver_);
+  lv_obj_set_size(saver_panel, LV_SIZE_CONTENT, LV_SIZE_CONTENT);
+  lv_obj_set_style_bg_color(saver_panel, lv_color_white(), 0);
+  lv_obj_set_style_bg_opa(saver_panel, LV_OPA_70, 0);   // 70% 白: 够亮以衬托黑字, 又略微透出照片
+  lv_obj_set_style_radius(saver_panel, 14, 0);
+  lv_obj_set_style_border_width(saver_panel, 0, 0);
+  lv_obj_set_style_pad_all(saver_panel, 14, 0);
+  lv_obj_set_style_pad_row(saver_panel, 10, 0);
+  lv_obj_set_flex_flow(saver_panel, LV_FLEX_FLOW_COLUMN);   // 面板内部仍是 flex(竖排: 时钟 + 日期)
+  lv_obj_set_flex_align(saver_panel, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
+  lv_obj_clear_flag(saver_panel, LV_OBJ_FLAG_SCROLLABLE);
+  // 文字默认色: 面板内所有文字用黑色(label 内部也可各自覆盖)
+  lv_obj_set_style_text_color(saver_panel, lv_color_black(), 0);
+  // ★ 面板用绝对定位落在屏幕下方(避开照片里的人脸)。
+  //   横向居中, 纵向: 顶部偏移屏高的 kSaverPanelTopPct%, 面板高度自适应。
+  //   因为外层已不是 flex, 这里的 align 不会再被覆盖, 照片也不会被一起推走。
+  lv_obj_align(saver_panel, LV_ALIGN_TOP_MID, 0, (int)(height_ * kSaverPanelTopPct / 100));
+
+  /* 大时钟: 普通文本 "HH:MM" (2026-10-13 由 7 段数码管改为普通显示) */
+  // ★ 原来这里用 4 个数位容器 × 7 个小矩形(共 28 段) + 2 个冒号点拼"数码管"效果,
+  //   带有"灭段 20% 亮度"的鬼影。用户要求去掉数码管效果 → 改成一块普通 label。
+  //   顺带收益: 少了 30 个 lv_obj, 每次刷新也从"写 30 次 bg_opa"变成"改 1 次文本"。
+  saver_clock_label_ = lv_label_create(saver_panel);
+  lv_obj_set_style_text_font(saver_clock_label_, &font_saver_clock_72_4, 0);
+  lv_obj_set_style_text_color(saver_clock_label_, lv_color_black(), 0);
+  // 时间未对时成功(或初值)时, 显示占位符, 避免出现 "00:00" 误导
+  lv_label_set_text(saver_clock_label_, "--:--");
+
+  // 日期 (白底板内, 黑字)。
+  // ★ 字号 16 → 26: 用户反馈"日期字体太小看不清"。字体是预渲染位图,
+  //   变大只能换更大 size 的字体文件(见文件顶部的 LV_FONT_DECLARE 注释)。
+  saver_date_label_ = lv_label_create(saver_panel);
+  lv_obj_set_style_text_font(saver_date_label_, &font_saver_26_4, 0);
+  lv_obj_set_style_text_color(saver_date_label_, lv_color_black(), 0);
+  lv_label_set_text(saver_date_label_, "----/--/--");
+
+  // 温湿度行 (2026-10-14 新增, 用户要求"在时间下方显示现在的温湿度")。
+  // ★ 放在日期行之后: 面板内部是 flex 竖排(COLUMN), 新 label 自动排到日期下方,
+  //   不需要改任何坐标, 也不会影响时钟/日期/照片的位置。
+  // ★ 文案 "温 32C 湿 33%" 宽 169px, 面板内可用宽 212px, 余 43px。
+  //   温度湿度都取整, 是量过宽度的结果:
+  //     "温 32.3C 湿 32.6%" = 221px  → 溢出 9px ✗
+  //     "温 32C 湿 33%"      = 169px  → 安全    ✓ (最坏值 99C/100% 也只有 182px)
+  //   另外不用 "°C": SimHei 里 ° 是全角 26px, "25.3°C" 会到 221px 直接溢出;
+  //   用 C 表示摄氏度, 语义清楚又省一半宽度。
+  saver_env_label_ = lv_label_create(saver_panel);
+  lv_obj_set_style_text_font(saver_env_label_, &font_saver_26_4, 0);
+  lv_obj_set_style_text_color(saver_env_label_, lv_color_black(), 0);
+  // 初值: 传感器还没读数时显示占位符, 不要显示 0C 那是误导
+  lv_label_set_text(saver_env_label_, "温 -- 湿 --");
+
+  // ★ 底部提示行("说句话或按 BOOT")已按用户要求【整行删除】(2026-10-13)。
+  //   相关成员 saver_hint_label_ 也已从 display.h 移除, 面板内只剩 时钟 + 日期 + 温湿度 三行。
+
+  lvgl_port_unlock();
+}
+
+void Display::StartSensorUi() {
+  lvgl_port_lock(0);
+
+  auto screen = lv_display_get_screen_active(display_);
+  lv_obj_set_style_bg_color(screen, current_theme_.background, 0);
+  lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);  // ★ 同 StartChatUi: 不设 opa 会透成黑底
+  lv_obj_set_style_text_font(screen, &font_puhui_16_4, 0);
+  lv_obj_set_style_text_color(screen, current_theme_.text, 0);
+
+  // 标题
+  sensor_title_label_ = lv_label_create(screen);
+  lv_label_set_text(sensor_title_label_, "传感器数据");
+  lv_obj_align(sensor_title_label_, LV_ALIGN_TOP_MID, 0, 30);
+  lv_obj_set_style_text_font(sensor_title_label_, &font_puhui_16_4, 0);
+
+  // 温度
+  sensor_temp_label_ = lv_label_create(screen);
+  lv_label_set_text(sensor_temp_label_, "温度: --");
+  lv_obj_align(sensor_temp_label_, LV_ALIGN_CENTER, 0, -30);
+  lv_obj_set_style_text_font(sensor_temp_label_, &font_puhui_16_4, 0);
+
+  // 湿度
+  sensor_hum_label_ = lv_label_create(screen);
+  lv_label_set_text(sensor_hum_label_, "湿度: --");
+  lv_obj_align(sensor_hum_label_, LV_ALIGN_CENTER, 0, 10);
+  lv_obj_set_style_text_font(sensor_hum_label_, &font_puhui_16_4, 0);
+
+  // 错误/状态信息
+  sensor_msg_label_ = lv_label_create(screen);
+  lv_label_set_text(sensor_msg_label_, "");
+  lv_obj_align(sensor_msg_label_, LV_ALIGN_BOTTOM_MID, 0, -25);
+  lv_obj_set_style_text_color(sensor_msg_label_, lv_color_hex(0x888888), 0);
+  lv_obj_set_width(sensor_msg_label_, LV_HOR_RES - 20);
+  lv_obj_set_style_text_align(sensor_msg_label_, LV_TEXT_ALIGN_CENTER, 0);
+
+  lvgl_port_unlock();
+}
+
+void Display::SetSensorData(float temperature, float humidity, bool valid, const char* msg) {
+  if (kind_ != Kind::kSensor || display_ == nullptr) {
+    return;
+  }
+  lvgl_port_lock(0);
+  if (valid) {
+    char buf_temp[32];
+    snprintf(buf_temp, sizeof(buf_temp), "温度: %.1f °C", temperature);
+    lv_label_set_text(sensor_temp_label_, buf_temp);
+
+    char buf_hum[32];
+    snprintf(buf_hum, sizeof(buf_hum), "湿度: %.0f %%", humidity);
+    lv_label_set_text(sensor_hum_label_, buf_hum);
+
+    if (sensor_msg_label_ != nullptr) {
+      lv_label_set_text(sensor_msg_label_, "");
+    }
+  } else {
+    lv_label_set_text(sensor_temp_label_, "温度: --");
+    lv_label_set_text(sensor_hum_label_, "湿度: --");
+    if (sensor_msg_label_ != nullptr) {
+      lv_label_set_text(sensor_msg_label_, msg != nullptr ? msg : "传感器无响应");
+    }
+  }
+  lvgl_port_unlock();
+}
+
+// 屏保温湿度行: 由主循环在 SensorPoll() 之后调用(每 3 秒一次)。
+// ★ 只在数据真正变化时才写 label: 每 3 秒无条件写一次文本会让 LVGL 每次都重绘,
+//   白白吃 CPU(屏保本意是省电/省寿命)。
+// ★ 这里不调用 WakeUp(): 传感器数据更新属于"后台刷新", 不应把用户从屏保里踢出来。
+void Display::SetEnvForScreenSaver(float temperature, float humidity, bool valid) {
+  if (kind_ != Kind::kChat || display_ == nullptr || saver_env_label_ == nullptr) {
+    return;  // 只有主屏屏保有这一行
+  }
+
+  // 变化判定阈值: 温度 0.5°C, 湿度 0.5%。
+  // ★ 阈值必须 >= 显示精度, 否则会出现"数值在临界点反复跳 -> 每 3 秒都重绘"。
+  //   显示是整数(%.0f), 所以取 0.5 —— 只有跨过整数台阶才刷, 稳态下几乎不刷。
+  const bool changed = !saver_env_has_value_ || (valid != saver_env_valid_) ||
+                       (valid && (temperature > saver_env_temp_ + 0.5f || temperature < saver_env_temp_ - 0.5f ||
+                                  humidity > saver_env_hum_ + 0.5f || humidity < saver_env_hum_ - 0.5f));
+  if (!changed) {
+    return;
+  }
+
+  saver_env_temp_ = temperature;
+  saver_env_hum_ = humidity;
+  saver_env_valid_ = valid;
+  saver_env_has_value_ = true;
+
+  char buf[32] = {0};
+  if (valid) {
+    // 文案 "温 32C 湿 33%" —— 温度湿度都取整。
+    // ★ 为什么温度不显示小数: 实测 "温 32.3C 湿 32.6%" 宽 221px, 超过面板内可用宽
+    //   212px 直接溢出; 取整后 169px, 即使最坏值 "温 99C 湿 100%" 也只有 182px,
+    //   留 30px 余量。且屏保是"扫一眼"的场景, 整数比小数更好读, 温湿度是慢变量
+    //   整数精度足够。这里用 %.0f 且四舍五入(snprintf 的 %.0f 默认四舍五入)。
+    snprintf(buf, sizeof(buf), "温 %.0fC 湿 %.0f%%", temperature, humidity);
+  } else {
+    snprintf(buf, sizeof(buf), "温 -- 湿 --");
+  }
+
+  lvgl_port_lock(0);
+  lv_label_set_text(saver_env_label_, buf);
+  lvgl_port_unlock();
+}
+
+#define MAX_MESSAGES (5)
+void Display::SetChatMessage(const Role role, const std::string& content) {
+  if (content.empty()) {
+    return;
+  }
+  WakeUp();  // 有新消息 = 有活动, 退出屏保并重置闲置计时
+
+  lvgl_port_lock(0);
+
+  // 检查消息数量是否超过限制
+  uint32_t child_count = lv_obj_get_child_cnt(content_);
+  if (child_count >= MAX_MESSAGES) {
+    // 删除最早的消息（第一个子对象）
+    lv_obj_t* first_child = lv_obj_get_child(content_, 0);
+    lv_obj_t* last_child = lv_obj_get_child(content_, child_count - 1);
+    if (first_child != nullptr) {
+      lv_obj_del(first_child);
+    }
+    // Scroll to the last message immediately
+    if (last_child != nullptr) {
+      lv_obj_scroll_to_view_recursive(last_child, LV_ANIM_OFF);
+    }
+  }
+
+  // Create a message bubble
+  lv_obj_t* msg_bubble = lv_obj_create(content_);
+  lv_obj_set_style_radius(msg_bubble, 8, 0);
+  lv_obj_set_scrollbar_mode(msg_bubble, LV_SCROLLBAR_MODE_OFF);
+  lv_obj_set_style_border_width(msg_bubble, 1, 0);
+  lv_obj_set_style_border_color(msg_bubble, current_theme_.border, 0);
+  lv_obj_set_style_bg_opa(msg_bubble, LV_OPA_COVER, 0);  // ★ 气泡背景必须不透明, 否则透出黑底
+  lv_obj_set_style_pad_all(msg_bubble, 8, 0);
+
+  // Create the message text
+  lv_obj_t* msg_text = lv_label_create(msg_bubble);
+  lv_label_set_text(msg_text, content.c_str());
+
+  // 计算文本实际宽度
+  lv_coord_t text_width = lv_txt_get_width(content.c_str(), content.size(), &font_puhui_16_4, 0);
+
+  // 计算气泡宽度
+  lv_coord_t max_width = LV_HOR_RES * 85 / 100 - 16;  // 屏幕宽度的85%
+  lv_coord_t min_width = 20;
+  lv_coord_t bubble_width;
+
+  // 确保文本宽度不小于最小宽度
+  if (text_width < min_width) {
+    text_width = min_width;
+  }
+
+  // 如果文本宽度小于最大宽度，使用文本宽度
+  if (text_width < max_width) {
+    bubble_width = text_width;
+  } else {
+    bubble_width = max_width;
+  }
+
+  // 设置消息文本的宽度
+  lv_obj_set_width(msg_text, bubble_width);  // 减去padding
+  lv_label_set_long_mode(msg_text, LV_LABEL_LONG_WRAP);
+  lv_obj_set_style_text_font(msg_text, &font_puhui_16_4, 0);
+
+  // 设置气泡宽度
+  lv_obj_set_width(msg_bubble, bubble_width);
+  lv_obj_set_height(msg_bubble, LV_SIZE_CONTENT);
+
+  // Set alignment and style based on message role
+  if (role == Role::kUser) {
+    lv_obj_set_style_bg_color(msg_bubble, current_theme_.user_bubble, 0);
+    lv_obj_set_style_text_color(msg_text, current_theme_.text, 0);
+    lv_obj_set_user_data(msg_bubble, (void*)"user");
+    lv_obj_set_width(msg_bubble, LV_SIZE_CONTENT);
+    lv_obj_set_height(msg_bubble, LV_SIZE_CONTENT);
+    lv_obj_set_style_flex_grow(msg_bubble, 0, 0);
+  } else if (role == Role::kAssistant) {
+    lv_obj_set_style_bg_color(msg_bubble, current_theme_.assistant_bubble, 0);
+    // AI 回复文字用蓝色(白底气泡上对比清晰)
+    lv_obj_set_style_text_color(msg_text, current_theme_.assistant_text, 0);
+    lv_obj_set_user_data(msg_bubble, (void*)"assistant");
+    lv_obj_set_width(msg_bubble, LV_SIZE_CONTENT);
+    lv_obj_set_height(msg_bubble, LV_SIZE_CONTENT);
+    lv_obj_set_style_flex_grow(msg_bubble, 0, 0);
+  } else if (role == Role::kSystem) {
+    lv_obj_set_style_bg_color(msg_bubble, current_theme_.system_bubble, 0);
+    lv_obj_set_style_text_color(msg_text, current_theme_.system_text, 0);
+    lv_obj_set_user_data(msg_bubble, (void*)"system");
+    lv_obj_set_width(msg_bubble, LV_SIZE_CONTENT);
+    lv_obj_set_height(msg_bubble, LV_SIZE_CONTENT);
+    lv_obj_set_style_flex_grow(msg_bubble, 0, 0);
+  }
+
+  // Create a full-width container for user messages to ensure right alignment
+  if (role == Role::kUser) {
+    lv_obj_t* container = lv_obj_create(content_);
+    lv_obj_set_width(container, LV_HOR_RES);
+    lv_obj_set_height(container, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(container, 0, 0);
+    lv_obj_set_style_pad_all(container, 0, 0);
+    lv_obj_set_parent(msg_bubble, container);
+    lv_obj_align(msg_bubble, LV_ALIGN_RIGHT_MID, -25, 0);
+    lv_obj_scroll_to_view_recursive(container, LV_ANIM_ON);
+  } else if (role == Role::kSystem) {
+    lv_obj_t* container = lv_obj_create(content_);
+    lv_obj_set_width(container, LV_HOR_RES);
+    lv_obj_set_height(container, LV_SIZE_CONTENT);
+    lv_obj_set_style_bg_opa(container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(container, 0, 0);
+    lv_obj_set_style_pad_all(container, 0, 0);
+    lv_obj_set_parent(msg_bubble, container);
+    lv_obj_align(msg_bubble, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_scroll_to_view_recursive(container, LV_ANIM_ON);
+  } else {
+    lv_obj_align(msg_bubble, LV_ALIGN_LEFT_MID, 0, 0);
+    lv_obj_scroll_to_view_recursive(msg_bubble, LV_ANIM_ON);
+  }
+
+  chat_message_label_ = msg_text;
+  lvgl_port_unlock();
+}
+
+void Display::ShowStatus(const char* status) {
+  if (kind_ != Kind::kChat || status_label_ == nullptr) {
+    return;
+  }
+  WakeUp();  // 状态变化 = 有活动, 退出屏保并重置闲置计时
+  lvgl_port_lock(0);
+  lv_label_set_text(status_label_, status);
+  lv_obj_clear_flag(status_label_, LV_OBJ_FLAG_HIDDEN);
+  lv_obj_add_flag(notification_label_, LV_OBJ_FLAG_HIDDEN);
+  lvgl_port_unlock();
+}
+
+void Display::SetEmotion(const std::string& emotion) {
+  if (kind_ != Kind::kChat || emotion_label_ == nullptr) {
+    return;
+  }
+  WakeUp();  // 表情变化 = 有活动
+  std::map<std::string, const char*> emotion_map = {
+      {"neutral", "😶"}, {"happy", "🙂"},       {"laughing", "😆"},  {"funny", "😂"},     {"sad", "😔"},      {"angry", "😠"},   {"crying", "😭"},
+      {"loving", "😍"},  {"embarrassed", "😳"}, {"surprised", "😯"}, {"shocked", "😱"},   {"thinking", "🤔"}, {"winking", "😉"}, {"cool", "😎"},
+      {"relaxed", "😌"}, {"delicious", "🤤"},   {"kissy", "😘"},     {"confident", "😏"}, {"sleepy", "😴"},   {"silly", "😜"},   {"confused", "🙄"},
+  };
+
+  auto it = emotion_map.find(emotion);
+
+  lvgl_port_lock(0);
+  lv_obj_set_style_text_font(emotion_label_, font_emoji_32_init(), 0);
+  if (it != emotion_map.end()) {
+    lv_label_set_text(emotion_label_, it->second);
+  } else {
+    lv_label_set_text(emotion_label_, "😶");
+  }
+  lvgl_port_unlock();
+}
+
+// ==================== 屏保 (时钟) ====================
+
+// 唤醒: 若屏保正显示则隐藏, 并把闲置计时清零
+// 所有"有活动"的公开方法(ShowStatus/SetChatMessage/SetEmotion)内部都会调用它,
+// 这样语音一响、文字一更新, 屏保就自动退掉, 不需要在 main.cpp 里到处插唤醒代码
+// ★★ 睡觉锁例外(sleep_lock_): 语音指令"待机"进的屏保, 不能被 AI 自己的回复语音
+//   (EmotionEvent/ChatMessageEvent → WakeUp)反过来关掉。锁住期间本函数
+//   只刷新闲置计时、保持屏保可见; 等真正的用户活动到来时由 main.cpp 解锁。
+void Display::WakeUp() {
+  last_activity_ms_ = NowMs();  // 无论是否在屏保中, 都重置闲置计时
+  if (!screen_saver_active_) {
+    return;
+  }
+  // ★ 睡觉锁生效中: 屏保是用户主动要求的, 不因 TTS/表情/文字事件而退出。
+  if (sleep_lock_) {
+    return;
+  }
+  if (kind_ != Kind::kChat || screen_saver_ == nullptr) {
+    screen_saver_active_ = false;
+    return;
+  }
+  lvgl_port_lock(0);
+  lv_obj_add_flag(screen_saver_, LV_OBJ_FLAG_HIDDEN);
+  lvgl_port_unlock();
+  screen_saver_active_ = false;
+}
+
+// 解除语音睡觉锁(不动屏保本身)。
+// 触发时机由 main.cpp 把握: 【用户说了新的一句话】(ChatMessageEvent/kUser)。
+// ★ 不要再拿 ChatState::kListening 当解锁条件 —— 连续对话模式下每轮都会进 kListening,
+//   等于没锁(2026-10-14 踩过, 现象是"进屏保后马上又被唤醒")。
+// 解锁 = "允许以后的 WakeUp() 生效"; 本函数末尾主动调一次 WakeUp(), 保证语义是
+// "解锁 + 立刻恢复正常唤醒行为", 调用方无需再跟一次。
+void Display::ReleaseSleepLock() {
+  if (!sleep_lock_) {
+    return;
+  }
+  sleep_lock_ = false;
+  printf("[Saver] sleep lock released\n");
+  WakeUp();  // 立刻恢复常规行为: 若有屏保则关掉, 并重置闲置计时
+}
+
+// 是否已过上锁宽限期。
+// 用途: 刚上锁后的 kSleepLockGraceMs 内, 忽略外部的解锁请求 ——
+// 防的是"发出'待机'那句话的用户语音, 其 ChatMessageEvent 因事件乱序晚于工具调用到达",
+// 那样会被误当成"用户又说话了"从而立刻解锁。宽限期一过, 解锁才算数。
+// 正常用户不可能在 1.2 秒内说完待机又接着说出下一句有意义的话, 所以不会误伤。
+bool Display::CanReleaseSleepLock() const {
+  if (!sleep_lock_) {
+    return false;
+  }
+  const uint32_t now = NowMs();
+  if (now - sleep_lock_armed_ms_ < kSleepLockGraceMs) {
+    printf("[Saver] sleep lock grace period: %ums left, release ignored\n",
+           (unsigned)(kSleepLockGraceMs - (now - sleep_lock_armed_ms_)));
+    return false;
+  }
+  return true;
+}
+
+// 手动立刻进入屏保(语音指令 "待机"/"退出"/"锁屏" 等触发)。
+// ★ 设计要点: 不复制进入代码, 而是把"闲置计时基准"往前拨 —— 拨到恰好刚满
+//   kScreenSaverIdleMs 的位置, 于是下一次 ScreenSaverTick() 的前置判定自然通过,
+//   走【与自动进入完全相同】的那条路径。
+//   好处: 屏保"进入"只有一条实现, 不会分叉成"手动/自动"两套状态机。
+// 为什么是 `NowMs() - kScreenSaverIdleMs` 而不是 `0`: last_activity_ms_ 用
+//   0xFFFFFFFF 当"尚未记录"的哨兵(见 ScreenSaverTick 里的说明), 写 0 会被
+//   当成"开机极早期的哨兵语义"从而走 return 分支; 写"刚满闲置"的值最安全。
+void Display::EnterScreenSaver() {
+  if (kind_ != Kind::kChat || screen_saver_ == nullptr) {
+    return;  // 只有主屏(聊天屏)有屏保
+  }
+  // ★★ 上睡觉锁: 让紧随其后的 AI 回复(EmotionEvent/ChatMessageEvent → WakeUp)
+  //   不能把刚点亮的屏保关掉。解锁由 main.cpp 在检测到真正用户活动时做。
+  sleep_lock_ = true;
+  sleep_lock_armed_ms_ = NowMs();  // 记录上锁时刻, 供 CanReleaseSleepLock() 的宽限期判定
+  if (screen_saver_active_) {
+    printf("[Saver] EnterScreenSaver: already active (sleep lock armed)\n");
+    return;  // 已在屏保中, 不重复动作(避免无谓重绘), 但锁仍要上
+  }
+  // 把活动计时拨到"刚满闲置时长" → 下一次 tick 立即判定该进屏保
+  last_activity_ms_ = NowMs() - kScreenSaverIdleMs;
+  printf("[Saver] EnterScreenSaver: requested by voice, forcing saver\n");
+  ScreenSaverTick();  // 立刻生效, 不等到下一个 loop 周期
+}
+
+// 进入屏保: 显示覆盖层并立刻刷一次时钟
+void Display::ScreenSaverTick() {
+  if (kind_ != Kind::kChat || screen_saver_ == nullptr) {
+    return;  // 只有主屏(聊天屏)有屏保
+  }
+
+  const uint32_t now = NowMs();
+
+  if (!screen_saver_active_) {
+    // ---- 判定是否该进入屏保 ----
+    // 用 0xFFFFFFFF 作"尚未记录活动"的哨兵值: 不能拿 0 当哨兵,
+    // 因为 esp_timer_get_time() 在开机极早期可能返回 <1000us, 使 NowMs() 恰好为 0。
+    if (last_activity_ms_ == kNoActivitySentinel) {
+      last_activity_ms_ = now;
+      return;  // 先补一个基准, 避免一开机就进屏保
+    }
+    if (now - last_activity_ms_ < kScreenSaverIdleMs) {
+      return;  // 还没闲够, 不动
+    }
+
+    // ---- 进入屏保 ----
+    screen_saver_active_ = true;
+    saver_last_clock_update_ms_ = kNoActivitySentinel;  // 强制下面立刻刷一次时钟
+    lvgl_port_lock(0);
+    lv_obj_clear_flag(screen_saver_, LV_OBJ_FLAG_HIDDEN);
+    lvgl_port_unlock();
+    printf("[Saver] screen saver ON\n");
+  }
+
+  // ---- 屏保中: 每秒刷新时钟 ----
+  if (saver_last_clock_update_ms_ != kNoActivitySentinel &&
+      now - saver_last_clock_update_ms_ < kScreenSaverClockIntervalMs) {
+    return;
+  }
+  saver_last_clock_update_ms_ = now;
+
+  // 取本地时间。NTP 未同步时 time() 返回很小的值(1970 附近), 此时显示占位符
+  const std::time_t t = std::time(nullptr);
+  // 2020-01-01 00:00:00 UTC = 1577836800。小于这个值说明还没完成 NTP 对时
+  constexpr std::time_t kMinValidTime = 1577836800;
+
+  // 两个字符串: 大时钟 "HH:MM" + 日期 "YYYY-MM-DD 周X"
+  char clock_text[8] = {0};
+  char date_text[32] = {0};
+
+  if (t < kMinValidTime) {
+    // 还没对时成功: 时钟显示占位符(不要显示 00:00, 那是误导), 日期显示提示
+    snprintf(clock_text, sizeof(clock_text), "--:--");
+    snprintf(date_text, sizeof(date_text), "对时中...");
+  } else {
+    struct tm timeinfo = {};
+    localtime_r(&t, &timeinfo);  // 线程安全版本
+    snprintf(clock_text, sizeof(clock_text), "%02d:%02d", timeinfo.tm_hour, timeinfo.tm_min);
+
+    static const char* kWeekDays[] = {"周日", "周一", "周二", "周三", "周四", "周五", "周六"};
+    const int wday = (timeinfo.tm_wday >= 0 && timeinfo.tm_wday < 7) ? timeinfo.tm_wday : 0;
+    snprintf(date_text, sizeof(date_text), "%04d-%02d-%02d %s", timeinfo.tm_year + 1900, timeinfo.tm_mon + 1,
+             timeinfo.tm_mday, kWeekDays[wday]);
+  }
+
+  lvgl_port_lock(0);
+  // 普通文本时钟: 直接改 label 文本即可(不再有 28 段要逐个设 bg_opa)
+  lv_label_set_text(saver_clock_label_, clock_text);
+  lv_label_set_text(saver_date_label_, date_text);
+  // ★ 温湿度行不在每秒刷: 传感器 3 秒才更新一次, 由 SetEnvForScreenSaver() 负责写。
+  //   放这里的话会把"最近一次有效值"每秒重写一遍, 白费 CPU。
+  lvgl_port_unlock();
+
+  // 诊断日志。★ 2026-10-15 卡顿优化: 原来【每秒】打印一行(约 90~110 字节)。
+  //   屏保是长时间驻留的状态, 每秒一条串口输出属于持续开销: 输出本身是同步阻塞的,
+  //   而且屏保期间 UI 几乎不变, 每秒重复同样的信息没有价值。
+  //   改为【每 60 秒】打一次 —— 仍然能确认屏保在跑、NTP 是否对时, 但开销降到 1/60。
+  //   (时钟文本每秒照常刷新, 只是不再每秒往串口吐字)
+  static uint32_t s_last_saver_log_ms = 0;
+  if (s_last_saver_log_ms != 0 && now - s_last_saver_log_ms < 60000) {
+    return;
+  }
+  s_last_saver_log_ms = now;
+  if (saver_env_valid_) {
+    printf("[Saver] idle=%us t=%ld clock='%s' date='%s' env='温 %.0fC 湿 %.0f%%'\n",
+           (unsigned)((now - last_activity_ms_) / 1000), (long)t, clock_text, date_text, saver_env_temp_,
+           saver_env_hum_);
+  } else {
+    printf("[Saver] idle=%us t=%ld clock='%s' date='%s' env='温 -- 湿 --'\n",
+           (unsigned)((now - last_activity_ms_) / 1000), (long)t, clock_text, date_text);
+  }
+}
+

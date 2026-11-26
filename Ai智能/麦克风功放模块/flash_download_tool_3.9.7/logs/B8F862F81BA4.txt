@@ -1,0 +1,83 @@
+*************************** START ****************************
+START TIME: 202510251416
+CONNECT BAUD: 115200
+set state: ESP_DL_SYNC
+serial port opened
+-----------
+baud:115200
+root baud:115200
+-------------
+===============BAUD : 115200===============CALL DEVICE SYNC
+connecting...
+mac l: 0x62f81ba4
+mac h: 0xb8f8
+get mac res: 1
+get flash id : 0x00184068
+manufacturer_id: 0x68
+device_id: 0x4018
+Wrote 7883900 bytes (2588309 compressed) at 0x00000000 in 43.0 seconds (effective 1465.5 kbit/s)...
+Hash of data verified.
+Leaving...
+com closed
+Use time: 66 s
+Download result: PASS
+*************************** END ****************************
+
+*************************** START ****************************
+START TIME: 202510271038
+CONNECT BAUD: 115200
+set state: ESP_DL_SYNC
+serial port opened
+-----------
+baud:115200
+root baud:115200
+-------------
+===============BAUD : 115200===============CALL DEVICE SYNC
+connecting...
+mac l: 0x62f81ba4
+mac h: 0xb8f8
+get mac res: 1
+get flash id : 0x00184068
+manufacturer_id: 0x68
+device_id: 0x4018
+Wrote 7883900 bytes (2588309 compressed) at 0x00000000 in 47.3 seconds (effective 1334.7 kbit/s)...
+Hash of data verified.
+Leaving...
+com closed
+Use time: 71 s
+Download result: PASS
+*************************** END ****************************
+
+*************************** START ****************************
+START TIME: 202510281347
+CONNECT BAUD: 115200
+serial port open error
+COM:COM414
+baud:115200
+SERIAL PORT OPEN ERROR
+set state: ESP_DL_CONNECT_ERROR
+*************************** START ****************************
+START TIME: 202510291340
+CONNECT BAUD: 115200
+set state: ESP_DL_SYNC
+serial port opened
+-----------
+baud:115200
+root baud:115200
+-------------
+===============BAUD : 115200===============CALL DEVICE SYNC
+connecting...
+mac l: 0x62f81ba4
+mac h: 0xb8f8
+get mac res: 1
+get flash id : 0x00184068
+manufacturer_id: 0x68
+device_id: 0x4018
+Wrote 7883900 bytes (2588309 compressed) at 0x00000000 in 32.4 seconds (effective 1944.3 kbit/s)...
+Hash of data verified.
+Leaving...
+com closed
+Use time: 50 s
+Download result: PASS
+*************************** END ****************************
+

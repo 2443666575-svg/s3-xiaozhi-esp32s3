@@ -1,0 +1,98 @@
+*************************** START ****************************
+START TIME: 202506281035
+CONNECT BAUD: 115200
+set state: ESP_DL_SYNC
+serial port opened
+-----------
+baud:115200
+root baud:115200
+-------------
+===============BAUD : 115200===============CALL DEVICE SYNC
+connecting...
+mac l: 0xa011fc40
+mac h: 0x30ed
+get mac res: 1
+get flash id : 0x00184068
+manufacturer_id: 0x68
+device_id: 0x4018
+Wrote 5110576 bytes (2566595 compressed) at 0x00000000 in 38.9 seconds (effective 1050.2 kbit/s)...
+Hash of data verified.
+Leaving...
+com closed
+Use time: 51 s
+Download result: PASS
+*************************** END ****************************
+
+*************************** START ****************************
+START TIME: 202506281039
+CONNECT BAUD: 115200
+set state: ESP_DL_SYNC
+serial port opened
+-----------
+baud:115200
+root baud:115200
+-------------
+===============BAUD : 115200===============CALL DEVICE SYNC
+connecting...
+mac l: 0xa011fc40
+mac h: 0x30ed
+get mac res: 1
+get flash id : 0x00184068
+manufacturer_id: 0x68
+device_id: 0x4018
+Wrote 5014496 bytes (2554004 compressed) at 0x00000000 in 40.4 seconds (effective 991.8 kbit/s)...
+Hash of data verified.
+Leaving...
+com closed
+Use time: 51 s
+Download result: PASS
+*************************** END ****************************
+
+*************************** START ****************************
+START TIME: 202506281148
+CONNECT BAUD: 115200
+serial port open error
+COM:COM370
+baud:115200
+SERIAL PORT OPEN ERROR
+set state: ESP_DL_CONNECT_ERROR
+*************************** START ****************************
+START TIME: 202506281148
+CONNECT BAUD: 115200
+serial port open error
+COM:COM370
+baud:115200
+SERIAL PORT OPEN ERROR
+set state: ESP_DL_CONNECT_ERROR
+*************************** START ****************************
+START TIME: 202506281148
+CONNECT BAUD: 115200
+serial port open error
+COM:COM370
+baud:115200
+SERIAL PORT OPEN ERROR
+set state: ESP_DL_CONNECT_ERROR
+*************************** START ****************************
+START TIME: 202506281148
+CONNECT BAUD: 115200
+serial port open error
+COM:COM370
+baud:115200
+SERIAL PORT OPEN ERROR
+set state: ESP_DL_CONNECT_ERROR
+*************************** START ****************************
+START TIME: 202506281148
+CONNECT BAUD: 115200
+serial port open error
+COM:COM370
+baud:115200
+SERIAL PORT OPEN ERROR
+set state: ESP_DL_CONNECT_ERROR
+*************************** START ****************************
+START TIME: 202506281148
+CONNECT BAUD: 115200
+serial port open error
+COM:COM370
+baud:115200
+SERIAL PORT OPEN ERROR
+set state: ESP_DL_CONNECT_ERROR

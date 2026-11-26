@@ -1,0 +1,292 @@
+/*
+ * ============================================================================
+ *  S3 板间串口通讯 —— 从板(B 板)固件
+ * ============================================================================
+ *
+ *  配套: A 板(小智语音板 ai_voice_display_lcd)通过 UART1 与本板通讯。
+ *        A 板侧已经写好了(InitSerialLink / SerialLinkPoll / self.serial.send /
+ *        self.serial.get_last), 本程序是【对面那块 S3】的固件。
+ *
+ *  ── 接线(必须交叉 + 必须共地) ───────────────────────────────────────────
+ *
+ *      A 板 IO39 (TX)  ──────▶  B 板 IO40 (RX)      ← 本板 RX
+ *      A 板 IO40 (RX)  ◀──────  B 板 IO39 (TX)      ← 本板 TX
+ *      A 板 GND        ───────  B 板 GND            ← 不共地 = 乱码或无数据
+ *
+ *    电平: 两边都是 3.3V TTL, 直连即可, 不需要电平转换。
+ *    ★ 交叉接线是最容易接错的地方: "TX 接 TX" 是错的, 必须 TX→RX 交叉。
+ *
+ *  ── 功能 ────────────────────────────────────────────────────────────────
+ *   收到一行文本 → 板载 RGB 灯亮起 + 闪 3 下 + 回一条 "ACK:xxx" 给 A 板。
+ *
+ *   支持的关键词(出现即生效, 中英文都认):
+ *     · 关 / 灭 / off / OFF      → 灯灭
+ *     · 其余任何内容             → 灯亮(这样 AI 随便说什么都能看到效果)
+ *     · 红/绿/蓝/黄/青/紫/白 或 red/green/blue/... → 换颜色
+ *     · PING                     → 回 "PONG"(专门用于测试线路通不通)
+ *
+ *  ── 协议 ────────────────────────────────────────────────────────────────
+ *   行协议: 以 '\n' 结尾的 UTF-8 文本, 与 A 板完全一致。
+ *   若对方发的内容不带换行, 靠 200ms 空闲超时兜底(不会丢数据)。
+ *
+ *  ── 烧录设置(Arduino IDE) ──────────────────────────────────────────────
+ *   开发板(Board):        ESP32S3 Dev Module
+ *   USB CDC On Boot:      Enabled     ← 必须开, 否则电脑上看不到本程序的日志
+ *   Flash Size:           按实际板子选(常见 8MB / 16MB)
+ *   Partition Scheme:     默认即可(本程序很小)
+ *   PSRAM:                按实际选, 没有就 Disabled
+ *
+ *  ── ★ 板载 RGB 灯的位置(这里有坑, 务必看) ──────────────────────────────
+ *   ESP32-S3-DevKitC-1 两个版本的板载 RGB 灯引脚【不一样】:
+ *       v1.0 → GPIO48
+ *       v1.1 → GPIO38     ← 本目录附带的原理图 SCH_ESP32-S3-DevKitC-1_V1.1.pdf
+ *                            里写的是 "RGB_CTRL → GPIO38", 即这个版本
+ *
+ *   为了让你第一次烧录就能看到灯亮, 下面【同时驱动 48 和 38 两个引脚】:
+ *   哪个灯亮, 就说明你的板子是哪个版本 —— 确认后可以把多余的删掉。
+ *   (写到一个没接灯的引脚上没有任何副作用, 只是发了一串没人听的数据。)
+ * ============================================================================
+ */
+
+#include <Arduino.h>
+
+// ===================== 串口配置 (必须与 A 板一致) =====================
+constexpr gpio_num_t kLinkRxPin = GPIO_NUM_40;  // 本机接收 ← 接 A 板 TX(39)
+constexpr gpio_num_t kLinkTxPin = GPIO_NUM_39;  // 本机发送 → 接 A 板 RX(40)
+constexpr uint32_t kLinkBaud = 115200;          // 波特率两端必须一致
+constexpr uint32_t kLinkFrameIdleMs = 200;      // 无换行时: 空闲这么久即视为一帧结束
+
+// ★ 用 UART1, 不用 UART0 —— UART0(IO43/44) 是下载/日志口, 抢它会出问题。
+HardwareSerial LinkSerial(1);
+
+// ===================== 板载 RGB 灯 (WS2812) =====================
+// 见文件头说明: v1.0=GPIO48, v1.1=GPIO38。两个都发以兼容两种版本。
+// ★ 本板只有一颗灯, 用 Arduino 核心 3.x 内置的 rgbLedWrite() 即可,
+//   不需要额外的 led_strip 库或任何文件。
+constexpr uint8_t kRgbLedPins[] = {48, 38};
+constexpr size_t kRgbLedPinCount = sizeof(kRgbLedPins) / sizeof(kRgbLedPins[0]);
+
+// ===================== 接收组帧状态 =====================
+char g_rx_buf[192] = {0};        // 收满一行前的临时缓冲
+size_t g_rx_len = 0;             // 已收字节数
+uint32_t g_rx_first_byte_ms = 0; // 本帧第一个字节到达时刻(空闲超时判定用)
+
+// ===================== LED 状态 =====================
+bool g_led_on = false;                 // 当前开关状态(收到第一条数据才会亮)
+uint8_t g_r = 0, g_g = 0, g_b = 255;   // 当前颜色, 默认蓝色
+constexpr uint8_t kBaseBrightness = 40;  // 常态亮度(0~255)。太亮刺眼, 40 足够看清
+
+// ---- 以下三个变量用于"颜色没变就不重复发"的去重 ----
+// 理由: rgbLedWrite 每次都要走一遍 RMT 把 WS2812 波形发出去, 有开销;
+//       主循环每圈都调用的话纯属浪费, 所以记住"上次写进去的值"。
+uint8_t g_shown_r = 0, g_shown_g = 0, g_shown_b = 0;
+bool g_shown_valid = false;
+
+// ---- 闪烁状态(收到数据就闪 3 下) ----
+uint32_t g_blink_until_ms = 0;   // 闪烁截止时刻; 0 表示不在闪烁
+uint32_t g_blink_toggle_ms = 0;  // 上次翻转亮灭的时刻
+bool g_blink_lit = false;        // 当前亮/灭
+
+// ===================== LED 基础操作 =====================
+
+// 按 kBaseBrightness 缩放颜色分量
+static inline uint8_t Scaled(uint8_t v) {
+  return static_cast<uint8_t>(static_cast<uint16_t>(v) * kBaseBrightness / 255);
+}
+
+// 把颜色写到灯上(两个候选引脚都写一遍)。
+// ★ 去重: 颜色与上次相同就直接返回, 避免主循环每圈重发 RMT 波形。
+static void WriteLeds(uint8_t r, uint8_t g, uint8_t b) {
+  if (g_shown_valid && r == g_shown_r && g == g_shown_g && b == g_shown_b) {
+    return;
+  }
+  for (size_t i = 0; i < kRgbLedPinCount; ++i) {
+    rgbLedWrite(kRgbLedPins[i], r, g, b);
+  }
+  g_shown_r = r;
+  g_shown_g = g;
+  g_shown_b = b;
+  g_shown_valid = true;
+}
+
+// 开始闪烁(非阻塞: 只记下截止时刻, 实际翻转由 LedTick 逐步做)
+static void StartBlink(uint32_t duration_ms) {
+  const uint32_t now = millis();
+  g_blink_until_ms = now + duration_ms;
+  g_blink_toggle_ms = now;
+  g_blink_lit = true;
+}
+
+// 闪烁 + 常态显示的调度。主循环每圈调用, 非阻塞。
+static void LedTick() {
+  const uint32_t now = millis();
+
+  // ---- 闪烁阶段: 每 100ms 翻转一次亮灭 ----
+  if (g_blink_until_ms != 0 && static_cast<int32_t>(now - g_blink_until_ms) < 0) {
+    if (now - g_blink_toggle_ms >= 100) {
+      g_blink_toggle_ms = now;
+      g_blink_lit = !g_blink_lit;
+    }
+    if (g_blink_lit) {
+      WriteLeds(Scaled(g_r), Scaled(g_g), Scaled(g_b));
+    } else {
+      WriteLeds(0, 0, 0);
+    }
+    return;
+  }
+
+  // ---- 闪烁结束 → 回到常态 ----
+  if (g_blink_until_ms != 0) {
+    g_blink_until_ms = 0;
+  }
+  if (g_led_on) {
+    WriteLeds(Scaled(g_r), Scaled(g_g), Scaled(g_b));
+  } else {
+    WriteLeds(0, 0, 0);
+  }
+}
+
+// ===================== 指令解析 =====================
+
+static bool Contains(const char* hay, const char* needle) {
+  return hay != nullptr && needle != nullptr && strstr(hay, needle) != nullptr;
+}
+
+// 处理收到的一行文本
+static void HandleLine(const char* line) {
+  if (line == nullptr || line[0] == '\0') {
+    return;
+  }
+  Serial.printf("[RX] %s\n", line);
+
+  // ---- PING → PONG: 专门用来验证线路通不通 ----
+  if (Contains(line, "PING") || Contains(line, "ping") || Contains(line, "Ping")) {
+    LinkSerial.print("PONG\n");
+    Serial.println("[TX] PONG");
+    StartBlink(300);
+    return;
+  }
+
+  // ---- 颜色(先定色, 再定开关) ----
+  // 没提到颜色就保持原色不动。
+  if (Contains(line, "红") || Contains(line, "red") || Contains(line, "RED")) {
+    g_r = 255; g_g = 0;   g_b = 0;
+  } else if (Contains(line, "绿") || Contains(line, "green") || Contains(line, "GREEN")) {
+    g_r = 0;   g_g = 255; g_b = 0;
+  } else if (Contains(line, "蓝") || Contains(line, "blue") || Contains(line, "BLUE")) {
+    g_r = 0;   g_g = 0;   g_b = 255;
+  } else if (Contains(line, "黄") || Contains(line, "yellow")) {
+    g_r = 255; g_g = 255; g_b = 0;
+  } else if (Contains(line, "青") || Contains(line, "cyan")) {
+    g_r = 0;   g_g = 255; g_b = 255;
+  } else if (Contains(line, "紫") || Contains(line, "purple") || Contains(line, "magenta")) {
+    g_r = 255; g_g = 0;   g_b = 255;
+  } else if (Contains(line, "白") || Contains(line, "white")) {
+    g_r = 255; g_g = 255; g_b = 255;
+  }
+
+  // ---- 开关 ----
+  // 只有明确说"关/灭/off"才熄灭, 其余一律点亮
+  // (这样 AI 转发的任意文本都能看到效果, 符合"收到就亮"的预期)。
+  if (Contains(line, "关") || Contains(line, "灭") ||
+      Contains(line, "off") || Contains(line, "OFF")) {
+    g_led_on = false;
+  } else {
+    g_led_on = true;
+  }
+
+  StartBlink(600);  // 收到数据闪 3 下(每 100ms 翻转一次)
+
+  // ---- 回执给 A 板 ----
+  // 回一条 ACK, 这样 A 板用 self.serial.get_last 就能读到"对面收到了"。
+  LinkSerial.print("ACK:");
+  LinkSerial.print(line);
+  LinkSerial.print('\n');
+  Serial.printf("[TX] ACK:%s\n", line);
+}
+
+// ===================== 串口接收轮询(非阻塞) =====================
+// ★ 全程不 delay、不阻塞: 收到就组帧, 组满一帧立即处理。
+static void SerialLinkPoll() {
+  const uint32_t now = millis();
+
+  while (LinkSerial.available() > 0) {
+    const int c = LinkSerial.read();
+    if (c < 0) {
+      break;
+    }
+    // 换行 = 一帧结束
+    if (c == '\n' || c == '\r') {
+      if (g_rx_len > 0) {
+        g_rx_buf[g_rx_len] = '\0';
+        HandleLine(g_rx_buf);
+        g_rx_len = 0;
+        g_rx_buf[0] = '\0';
+      }
+      continue;
+    }
+    if (g_rx_len == 0) {
+      g_rx_first_byte_ms = now;
+    }
+    if (g_rx_len < sizeof(g_rx_buf) - 1) {
+      g_rx_buf[g_rx_len++] = static_cast<char>(c);
+    } else {
+      // 缓冲满了还没见到换行: 把已有内容当一帧处理掉再重置,
+      // 避免"死等换行"把后续数据一起吞掉。
+      g_rx_buf[g_rx_len] = '\0';
+      HandleLine(g_rx_buf);
+      g_rx_len = 0;
+      g_rx_buf[0] = '\0';
+    }
+  }
+
+  // 空闲超时提交: 对方发的内容没带换行时也能收到
+  if (g_rx_len > 0 && (now - g_rx_first_byte_ms) >= kLinkFrameIdleMs) {
+    g_rx_buf[g_rx_len] = '\0';
+    HandleLine(g_rx_buf);
+    g_rx_len = 0;
+    g_rx_buf[0] = '\0';
+  }
+}
+
+// ===================== setup / loop =====================
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);  // 等 USB CDC 枚举完成(否则开头的日志会丢)
+
+  Serial.println();
+  Serial.println("======================================================");
+  Serial.println("  S3 从板(B 板) —— 板间串口通讯");
+  Serial.println("======================================================");
+  Serial.printf("  本板串口 : UART1  RX=IO%d(接A板TX39)  TX=IO%d(接A板RX40)  %ubps\n",
+                static_cast<int>(kLinkRxPin), static_cast<int>(kLinkTxPin),
+                static_cast<unsigned>(kLinkBaud));
+  Serial.printf("  板载 RGB : 同时驱动 IO%d 与 IO%d  (v1.0=48 / v1.1=38)\n",
+                static_cast<int>(kRgbLedPins[0]), static_cast<int>(kRgbLedPins[1]));
+  Serial.println("  接线     : 必须【交叉】且【共地】, 见本文件开头说明");
+  Serial.println("------------------------------------------------------");
+  Serial.println("  等待 A 板发数据... 收到就会亮灯 + 闪 3 下 + 回 ACK");
+  Serial.println("======================================================");
+
+  // 打开 UART1。★ 参数顺序是 begin(baud, config, rxPin, txPin) —— rx 在前!
+  LinkSerial.begin(kLinkBaud, SERIAL_8N1, kLinkRxPin, kLinkTxPin);
+  LinkSerial.setTimeout(20);
+
+  // 开机自检: 红 → 绿 → 蓝 → 灭, 顺便确认灯和引脚是对的
+  Serial.println("[自检] 灯应依次显示 红→绿→蓝→灭");
+  const uint8_t kSelfTest[][3] = {{80, 0, 0}, {0, 80, 0}, {0, 0, 80}, {0, 0, 0}};
+  for (size_t k = 0; k < sizeof(kSelfTest) / sizeof(kSelfTest[0]); ++k) {
+    for (size_t i = 0; i < kRgbLedPinCount; ++i) {
+      rgbLedWrite(kRgbLedPins[i], kSelfTest[k][0], kSelfTest[k][1], kSelfTest[k][2]);
+    }
+    delay(250);
+  }
+  g_shown_valid = false;  // 复位去重状态, 让后续第一次 WriteLeds 真正写一次
+  Serial.println("[自检] 完成");
+}
+
+void loop() {
+  SerialLinkPoll();  // 收串口(非阻塞)
+  LedTick();         // 跑闪烁/常态显示
+}

@@ -1,0 +1,144 @@
+#pragma once
+
+#ifndef _DISPLAY_H_
+#define _DISPLAY_H_
+
+#include <esp_lcd_panel_ops.h>
+
+#include <string>
+
+#include "lvgl.h"
+
+class Display {
+ public:
+  enum class Role : uint8_t {
+    kSystem,
+    kAssistant,
+    kUser,
+  };
+  enum class Kind : uint8_t {
+    kChat,
+    kSensor,
+  };
+  Display(esp_lcd_panel_io_handle_t panel_io,
+          esp_lcd_panel_handle_t panel,
+          int width,
+          int height,
+          int offset_x,
+          int offset_y,
+          bool mirror_x,
+          bool mirror_y,
+          bool swap_xy,
+          Kind kind = Kind::kChat);
+  ~Display();
+  void Start();
+  void SetChatMessage(const Role role, const std::string& content);
+  void ShowStatus(const char* status);
+  void SetEmotion(const std::string& emotion);
+  // Sensor-mode only: 第二个屏用, 主屏 (kChat) 调用无效
+  void SetSensorData(float temperature, float humidity, bool valid, const char* msg = nullptr);
+
+  // ---------------- 屏保 (时钟) ----------------
+  // ScreenSaverTick(): 由 loop 周期调用(建议 100~200ms)。内部自行判定闲置时长:
+  //   - 闲置满 kScreenSaverIdleMs 自动进入屏保
+  //   - 屏保中每秒刷新一次时钟
+  //   - 任何"有活动"的事件(说话/回复/状态变化/按键)都会先调用 WakeUp() 重置计时
+  // WakeUp(): 手动唤醒(清屏保 + 重置闲置计时)。所有会改变界面的公开方法内部已自动调用,
+  //           外部(如按键回调)也可直接调。
+  void ScreenSaverTick();
+  void WakeUp();
+  bool IsScreenSaverActive() const { return screen_saver_active_; }
+
+  // EnterScreenSaver(): 手动【立刻】进入屏保(不等 30 秒闲置)。
+  // 用途: 语音指令 —— 用户说 "待机"、"退出"、"锁屏"、"休眠"、"黑屏" 等词时,
+  //       AI 调 self.display.sleep 工具 → main.cpp 调本方法 → 立刻显示屏保。
+  // 实现: 把 last_activity_ms_ 拨到"刚满闲置时长"的位置, 再直接复用进入逻辑。
+  //       为什么不全复制一份进入代码 —— 屏保状态机只有一条路径, 复制会分叉出
+  //       "手动进"和"自动进"两套状态, 以后改一处忘一处。
+  // ★★ 会同时上锁(sleep_lock_) —— 见 ReleaseSleepLock() 的说明, 这是必需的。
+  void EnterScreenSaver();
+
+  // ★★ 语音"睡觉锁" —— 解决"说完待机立刻被自己的语音回复吵醒"的死结。
+  // 问题现场: 用户说"待机" → AI 调 sleep 工具 → 屏保亮起 → 但 AI 紧接着要回一句
+  //   "好的, 已进入待机" → TTS 触发 EmotionEvent/ChatMessageEvent → 那些方法内部调
+  //   WakeUp() → 【屏保瞬间又被关掉】。现象就是"屏保闪一下没了"。
+  // 解法: EnterScreenSaver() 上一把锁, 锁住期间 WakeUp() 只重置闲置计时、
+  //   不真正关闭屏保; 等【用户真的说出新的一句话】时由 main.cpp 调 ReleaseSleepLock() 解锁。
+  // 为什么用"锁"而不是"延时唤醒": 延时是猜时长(AI 回复长短不一), 锁是精确的语义。
+  // ★★ 解锁点必须是 ChatMessageEvent/kUser (用户说了新话), 【不是】kListening ——
+  //   连续对话模式下 AFE 每轮都会自动进 kListening, 用它解锁等于没锁(踩过, 见 main.cpp 注释)。
+  // ★ 还带一道"上锁宽限期"(kSleepLockGraceMs): 刚上锁后的极短时间内忽略解锁请求,
+  //   防止"待机"那句用户语音因事件乱序晚于工具调用到达而误解锁。
+  void ReleaseSleepLock();
+  bool IsSleepLocked() const { return sleep_lock_; }
+  bool CanReleaseSleepLock() const;  // 是否已过上锁宽限期(供 main.cpp 判断)
+
+  // 屏保温湿度行用: 把环境传感器的最新读数喂给屏保。
+  // 主循环(SensorPoll 之后)调用, 与 SetSensorData 的区别:
+  //   - SetSensorData 是【第二个屏 Sensor 模式】用的静态数据页
+  //   - SetEnvForScreenSaver 是【主屏屏保面板】用的温湿度行
+  // 两者互不影响。valid=false 时屏保行显示 "温 -- 湿 --"。
+  void SetEnvForScreenSaver(float temperature, float humidity, bool valid);
+
+ private:
+  void StartChatUi();
+  void StartSensorUi();
+  struct ThemeColors {
+    lv_color_t background;
+    lv_color_t text;
+    lv_color_t chat_background;
+    lv_color_t user_bubble;
+    lv_color_t assistant_bubble;
+    lv_color_t assistant_text;  // AI 回复文字颜色(白底上用蓝色)
+    lv_color_t system_bubble;
+    lv_color_t system_text;
+    lv_color_t border;
+    lv_color_t low_battery;
+  };
+  uint32_t width_ = 0;
+  uint32_t height_ = 0;
+  Kind kind_ = Kind::kChat;
+  lv_display_t* display_ = nullptr;
+  // Chat-mode UI
+  lv_obj_t* container_ = nullptr;
+  lv_obj_t* status_bar_ = nullptr;
+  lv_obj_t* content_ = nullptr;
+  lv_obj_t* content_left_ = nullptr;
+  lv_obj_t* content_right_ = nullptr;
+  lv_obj_t* emotion_label_ = nullptr;
+  lv_obj_t* chat_message_label_ = nullptr;
+  lv_obj_t* network_label_ = nullptr;
+  lv_obj_t* notification_label_ = nullptr;
+  lv_obj_t* status_label_ = nullptr;
+  lv_obj_t* mute_label_ = nullptr;
+  // Sensor-mode UI
+  lv_obj_t* sensor_title_label_ = nullptr;
+  lv_obj_t* sensor_temp_label_ = nullptr;
+  lv_obj_t* sensor_hum_label_ = nullptr;
+  lv_obj_t* sensor_msg_label_ = nullptr;
+  // Screen-saver UI (chat mode only)
+  lv_obj_t* screen_saver_ = nullptr;       // 全屏覆盖层, 默认 HIDDEN
+  lv_obj_t* saver_clock_label_ = nullptr;  // 大时钟 "HH:MM"(普通文本, 72px)
+  lv_obj_t* saver_date_label_ = nullptr;   // 日期 2026-10-13 周二(26px)
+  lv_obj_t* saver_env_label_ = nullptr;    // 温湿度 "温 32C 湿 33%"(26px, 日期下方)
+  // ★ 2026-10-13 清理: 原 7 段数码管相关成员已删除(saver_clock_row_ / saver_segs_[4][7] /
+  //   saver_colon_dot_[2]), 底部提示行也按用户要求整行去掉(saver_hint_label_)。
+  // 屏保温湿度数据缓存(由 SetEnvForScreenSaver 更新, 只在数据变化时刷 label)
+  float saver_env_temp_ = 0.0f;
+  float saver_env_hum_ = 0.0f;
+  bool saver_env_valid_ = false;
+  bool saver_env_has_value_ = false;  // 是否曾收到过有效值(用于首次强制刷新)
+  bool screen_saver_active_ = false;                 // 当前是否处于屏保
+  // ★★ 语音睡觉锁: 语音指令进屏保后置 true, WakeUp() 在此标志下【只重置计时不关屏保】。
+  // 由 main.cpp 在检测到"用户说了新话"(ChatMessageEvent/kUser)时调 ReleaseSleepLock() 解除。
+  // 没有它的话, AI 回的那句 "好的已进入待机" 的 TTS 事件会立刻把刚点亮的屏保关掉。
+  bool sleep_lock_ = false;
+  uint32_t sleep_lock_armed_ms_ = 0;  // 上锁时刻, 用于"上锁宽限期"判定
+  // 计时基准。初值用哨兵(见 display.cpp 的 kNoActivitySentinel = 0xFFFFFFFF),
+  // 不可用 0: esp_timer_get_time() 开机极早期可能返回 <1000us, 使 NowMs() 恰好落在 0 而误判。
+  uint32_t last_activity_ms_ = 0xFFFFFFFFu;          // 最近一次"有活动"的时间戳
+  uint32_t saver_last_clock_update_ms_ = 0xFFFFFFFFu;  // 屏保时钟上次刷新时间戳
+  ThemeColors current_theme_;
+};
+
+#endif

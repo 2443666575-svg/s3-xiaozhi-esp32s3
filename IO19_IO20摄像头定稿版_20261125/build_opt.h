@@ -1,0 +1,2 @@
+-fno-exceptions -Wall -Werror -DLV_LVGL_H_INCLUDE_SIMPLE
+-Wno-error=address-of-packed-member

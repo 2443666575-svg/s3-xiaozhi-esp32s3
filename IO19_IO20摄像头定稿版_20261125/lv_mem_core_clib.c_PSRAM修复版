@@ -1,0 +1,111 @@
+/**
+ * @file lv_malloc_core.c
+ */
+
+/*********************
+ *      INCLUDES
+ *********************/
+#include "../lv_mem.h"
+#if LV_USE_STDLIB_MALLOC == LV_STDLIB_CLIB
+#include "../../stdlib/lv_mem.h"
+#include <stdlib.h>
+#include <esp_heap_caps.h>
+
+/* ★★★ 2026-11-25: PSRAM 优先分配器(小智主控专用修复)。
+ *   本机 sdkconfig: CONFIG_SPIRAM_USE_MALLOC=y, CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=4096
+ *   → 标准 malloc() 对所有 <=4096 字节的分配一律使用内部 RAM。
+ *   LVGL 的对象/样式/字符串/层缓冲小块几乎都 <4KB, 全部挤在仅 33KB 的内部 RAM 里,
+ *   而语音 websocket 的 mbedTLS 要 20KB+, 结果:
+ *       E esp-aes: Failed to allocate memory → WEBSOCKET_EVENT_ERROR → 语音掉线
+ *       http.POST 返回 -3 → 拍照能显示却不能识别
+ *   这里改成 PSRAM 优先、内部兜底: 所有 LVGL 分配都去 8MB PSRAM, 内部 RAM 留给音频/网络。
+ *   代价: PSRAM 访问比内部 RAM 慢约 2~3 倍, 240x320 / 33ms 的 UI 刷新仍可承受。
+ *   原文件已备份为 lv_mem_core_clib.c.bak_20261125, 回退直接覆盖即可。
+ */
+
+/*********************
+ *      DEFINES
+ *********************/
+
+/**********************
+ *      TYPEDEFS
+ **********************/
+
+/**********************
+ *  STATIC PROTOTYPES
+ **********************/
+
+/**********************
+ *  STATIC VARIABLES
+ **********************/
+
+/**********************
+ *      MACROS
+ **********************/
+/**********************
+ *   GLOBAL FUNCTIONS
+ **********************/
+
+void lv_mem_init(void)
+{
+    return; /*Nothing to init*/
+}
+
+void lv_mem_deinit(void)
+{
+    return; /*Nothing to deinit*/
+
+}
+
+lv_mem_pool_t lv_mem_add_pool(void * mem, size_t bytes)
+{
+    /*Not supported*/
+    LV_UNUSED(mem);
+    LV_UNUSED(bytes);
+    return NULL;
+}
+
+void lv_mem_remove_pool(lv_mem_pool_t pool)
+{
+    /*Not supported*/
+    LV_UNUSED(pool);
+    return;
+}
+
+void * lv_malloc_core(size_t size)
+{
+    void * p = heap_caps_malloc(size, MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+    if (p == NULL) p = heap_caps_malloc(size, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    return p;
+}
+
+void * lv_realloc_core(void * p, size_t new_size)
+{
+    void * q = heap_caps_realloc(p, new_size, MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+    if (q == NULL) q = heap_caps_realloc(p, new_size, MALLOC_CAP_8BIT | MALLOC_CAP_INTERNAL);
+    return q;
+}
+
+void lv_free_core(void * p)
+{
+    heap_caps_free(p);   /* 内部/PSRAM 指针都能正确释放 */
+}
+
+void lv_mem_monitor_core(lv_mem_monitor_t * mon_p)
+{
+    /*Not supported*/
+    LV_UNUSED(mon_p);
+    return;
+}
+
+lv_result_t lv_mem_test_core(void)
+{
+    /*Not supported*/
+    return LV_RESULT_OK;
+}
+
+/**********************
+ *   STATIC FUNCTIONS
+ **********************/
+
+#endif /*LV_STDLIB_CLIB*/

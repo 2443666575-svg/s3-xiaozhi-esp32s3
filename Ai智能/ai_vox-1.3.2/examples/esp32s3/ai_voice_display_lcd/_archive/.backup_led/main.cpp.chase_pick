@@ -1,0 +1,1582 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <Wire.h>              // I2C 总线(环境传感器 AHT20/BMP280)
+#include <Adafruit_AHTX0.h>    // AHT20 温湿度传感器
+#include <Adafruit_BMP280.h>   // BMP280 气压传感器
+#include <cstdint>
+#include <time.h>  // configTime / time / localtime (屏保时钟)
+#include <driver/spi_common.h>
+#include <esp_heap_caps.h>
+#include <esp_lcd_panel_io.h>
+#include <esp_lcd_panel_ops.h>
+#include <esp_lcd_panel_vendor.h>
+
+#include "ai_vox_engine.h"
+#include "audio_device/audio_input_device_i2s_std.h"
+#include "audio_device/audio_input_device_pdm.h"
+#include "audio_device/audio_output_device_i2s_std.h"
+#include "components/espressif/button/button_gpio.h"
+#include "components/espressif/button/iot_button.h"
+#include "components/espressif/esp_audio_codec/esp_audio_simple_dec.h"
+#include "components/espressif/esp_audio_codec/esp_mp3_dec.h"
+#include "components/wifi_configurator/wifi_configurator.h"
+#include "display.h"
+#include "led_strip.h"
+#include "network_config_mode_mp3.h"
+#include "network_connected_mp3.h"
+#include "notification_0_mp3.h"
+
+#ifndef ARDUINO_ESP32S3_DEV
+#error "This example only supports ESP32S3-Dev board."
+#endif
+
+#define AUDIO_INPUT_DEVICE_TYPE_PDM (0)
+#define AUDIO_INPUT_DEVICE_TYPE_I2S_STD (1)
+#define AUDIO_INPUT_DEVICE_TYPE AUDIO_INPUT_DEVICE_TYPE_PDM  // 鹿小班二合一模块的麦克风为 LMD2718 PDM 麦克风, 须用 PDM 模式
+// #define AUDIO_INPUT_DEVICE_TYPE AUDIO_INPUT_DEVICE_TYPE_I2S_STD
+
+/**
+ *  开机自动连接WiFi, 无需配网: 取消下面两个宏的注释并填写实际的WiFi名称和密码
+ *  若需要改为SmartConfig配网, 注释掉这两个宏即可
+ */
+#define WIFI_SSID "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+
+namespace {
+/**
+ *  SC_TYPE_ESPTOUCH            protocol: ESPTouch
+ *  SC_TYPE_AIRKISS,            protocol: AirKiss
+ *  SC_TYPE_ESPTOUCH_AIRKISS,   protocol: ESPTouch and AirKiss
+ *  SC_TYPE_ESPTOUCH_V2,        protocol: ESPTouch v2
+ */
+constexpr smartconfig_type_t kSmartConfigType = SC_TYPE_ESPTOUCH_AIRKISS;  // ESPTouch and AirKiss
+
+// Microphone pin configurations
+#if AUDIO_INPUT_DEVICE_TYPE == AUDIO_INPUT_DEVICE_TYPE_I2S_STD
+constexpr gpio_num_t kMicPinSck = GPIO_NUM_6;  // SCK (BCK, BCLK): Serial-Data Clock for I2S Interface
+constexpr gpio_num_t kMicPinWs = GPIO_NUM_5;   // WS (WR, WCLK): Serial Data-Word Select for I2S Interface
+constexpr gpio_num_t kMicPinSd = GPIO_NUM_4;   // SD (DIN, DOUT, DI, DO, DATA): Serial-Data Output for I2S Interface
+#elif AUDIO_INPUT_DEVICE_TYPE == AUDIO_INPUT_DEVICE_TYPE_PDM
+constexpr gpio_num_t kMicPinSck = GPIO_NUM_15;  // PDM CLK: 麦克风时钟
+constexpr gpio_num_t kMicPinSd = GPIO_NUM_7;    // PDM DATA: 麦克风数据
+#endif
+
+constexpr gpio_num_t kSpeakerPinSck = GPIO_NUM_9;  // SCK (BCK, BCLK): Serial-Data Clock for I2S Interface
+constexpr gpio_num_t kSpeakerPinWs = GPIO_NUM_10;  // WS (WR, WCLK): Serial Data-Word Select for I2S Interface
+constexpr gpio_num_t kSpeakerPinSd = GPIO_NUM_11;  // SD (DIN, DOUT, DI, DO, DATA): Serial-Data Output for I2S Interface
+
+constexpr gpio_num_t kButtonBoot = GPIO_NUM_0;
+
+constexpr gpio_num_t kDisplayBacklightPin = GPIO_NUM_46;
+constexpr gpio_num_t kDisplayMosiPin = GPIO_NUM_17;
+constexpr gpio_num_t kDisplayClkPin = GPIO_NUM_16;
+constexpr gpio_num_t kDisplayDcPin = GPIO_NUM_8;
+constexpr gpio_num_t kDisplayRstPin = GPIO_NUM_18;
+// 新屏为八针 ST7789 (GND/3V3/SCL/SDA/DC/RES/CS/BLK), 比七针版多一个 CS 引脚
+// CS 由 ESP 侧管理: esp_lcd 在每次 SPI 传输时自动拉低/拉高 CS, 分配 GPIO21
+constexpr gpio_num_t kDisplayCsPin = GPIO_NUM_21;  // 新屏 CS
+
+// ---------------- 板间串口通讯 (UART1, TX=IO39 / RX=IO40) ----------------
+// 用途: 与另一块 ESP32-S3 / ESP32 做【点对点串口通讯】, 双向收发。
+//       2026-10-07 起一直为串口预留这两个脚, 2026-10-14 现场复核确认未被占用。
+//
+// ★ 接线三要素(接错就是"永远收不到、且两边都不报错"这种闷声坑):
+//   1. 交叉: 本机 TX(39) -> 对方 RX; 本机 RX(40) -> 对方 TX   (同名相接是错的!)
+//   2. 共地: 本机 GND 必须与对方 GND 相连 (不共地 = 没有参考电平 = 乱码或完全无数据)
+//   3. 电平: 本机是 3.3V TTL。若对方是 5V 逻辑(如 Arduino UNO), 必须分压或加电平转换。
+//
+// ★ 关于 39/40 的特殊性: 在 ESP32-S3 上它们兼作【外部 JTAG】(MTCK/MTDO)。
+//   本工程默认用芯片内置的 USB-Serial/JTAG 调试通道, 所以这两脚可自由用作 UART。
+//   (官方文档: 若 USB Serial/JTAG 控制器用于调试, GPIO39~GPIO42 可用于其他功能)
+//   唯一代价: 若将来要接【外部 JTAG 调试器】, 需把串口挪到别的脚。
+constexpr gpio_num_t kLinkRxPin = GPIO_NUM_40;  // 本机接收 <- 接对方 TX
+constexpr gpio_num_t kLinkTxPin = GPIO_NUM_39;  // 本机发送 -> 接对方 RX
+constexpr uint32_t kLinkBaud = 115200;          // 波特率, 两端必须一致
+constexpr uint32_t kLinkFrameIdleMs = 200;      // 对端不带换行时的"帧结束"判定: 空闲这么久即视为一帧
+
+// ★ 必须用 UART1, 【绝不能】用 UART0: UART0(43/44) 被 USB 日志/下载占用,
+//   抢它会导致"烧录后持续复位、串口日志总在同一行截断"。
+HardwareSerial g_link_serial(1);
+
+// ---------------- WS2812 RGB 灯链 (GPIO38, RMT 驱动) ----------------
+// IO38 级联 8 颗 WS2812: IO38 -> R8 -> RGB1 -> RGB2 -> ... -> RGB8
+// ★ 2026-10-14 更新: 灯链已从 6 颗扩到 8 颗(用户 2026-10-14 16:18 实测 6 颗开关正常后扩测)。
+// ★ 2026-10-14 更正: 现已确认【没有板载灯】, 原"DevKitC 板载灯与 RGB1 并联"的注释作废。
+// ★★ 灯故障已解决(2026-10-14): 真因是 InitWs2812() 里手动 pinMode()+digitalWrite()
+//    产生的 IO MUX 毛刺被 WS2812 当成数据, 已删除。教训: WS2812 这类自定时器件
+//    的数据脚【绝不要手动翻转】, 时序全交给 led_strip 驱动。
+constexpr gpio_num_t kWs2812Pin = GPIO_NUM_38;
+constexpr uint32_t kWs2812Count = 8;  // 级联灯珠数量 (RGB1~RGB8)
+
+// ★ 调试开关: 开机时逐颗点亮自检。默认【关闭】。
+//   需要确认灯珠数量、级联顺序是否正确时, 改成 true 编译一次。
+//   逐颗点亮每颗 300ms(8 颗约 2.4 秒); 验证完记得改回 false。
+//   判读: 串口打到第 N 颗 vs 眼睛看到第几颗 —— 数目一致说明级联完整。
+constexpr bool kLedSelfTestOnBoot = false;
+
+// 灯效模式
+enum class LedMode {
+  kOff,      // 熄灭
+  kWhite,    // 常亮白灯
+  kBreath,   // 呼吸灯(白)
+  kRainbow,  // 彩色彩虹流水(整条带子铺满彩虹并滚动)
+  kChase,    // 跑马灯(单颗亮点在灯链上循环跑动)
+  kCustom,   // 指定灯亮(只点亮用户点名的若干颗, 颜色统一)
+};
+
+// 白灯亮度(0~255): 全白 255,255,255 太刺眼且发热, 用柔和白
+constexpr uint8_t kWhiteLevel = 200;
+// 呼吸灯参数: 单次呼吸(渐亮+渐暗)周期, 以及最低/最高亮度
+constexpr uint32_t kBreathPeriodMs = 2400;  // 一次完整呼吸 2.4 秒
+constexpr uint8_t kBreathMinLevel = 8;      // 最暗(接近灭但不断流)
+constexpr uint8_t kBreathMaxLevel = 200;    // 最亮
+
+// 跑马灯参数
+constexpr uint32_t kRainbowStepMs = 80;   // 每步间隔(ms): 越小跑得越快, 80ms 约 12.5 步/秒
+constexpr uint8_t kRainbowLevel = 180;    // 灯珠亮度上限(0~255): 彩色不要开到 255, 以免刺眼/发热
+constexpr uint8_t kRainbowHueStep = 32;   // 相邻灯珠色相步进(0~255 一圈): 32 = 每颗差 45°, 8 颗正好铺满 360°
+
+// 单点跑马灯参数(单颗亮点循环跑)
+constexpr uint32_t kChaseStepMs = 150;    // 每步间隔(ms): 亮点在这颗灯上停留多久
+constexpr uint8_t kChaseTailLevel = 60;   // 拖尾亮度(0=无拖尾只有一颗亮; 60=前一颗余晖, 观感更像"跑")
+
+// 指定灯参数
+constexpr uint8_t kCustomLevel = 200;     // "打开第N个灯"时该灯的亮度
+constexpr uint8_t kCustomHue = 85;        // 指定灯的颜色色相(0~255): 85 ≈ 绿色; 想换色改这里即可
+
+constexpr auto kDisplaySpiMode = 3;  // ST7789 串口协议用 SPI mode 3 (CPOL=1, CPHA=1); 若新屏点亮异常(白屏/花屏)可改试 mode 0
+constexpr uint32_t kDisplayWidth = 240;
+constexpr uint32_t kDisplayHeight = 320;  // 已确认新屏为 240x320 竖屏; max_transfer_sz 按宽x高自动计算
+constexpr bool kDisplayMirrorX = false;
+constexpr bool kDisplayMirrorY = false;
+constexpr bool kDisplayInvertColor = false;  // ★ 实测确认(2026-10-13 照片): true 时所有颜色显示成补色(白→黑、绿气泡→紫、蓝字→橙黄), 本屏必须 false
+constexpr bool kDisplaySwapXY = false;
+constexpr auto kDisplayRgbElementOrder = LCD_RGB_ELEMENT_ORDER_RGB;
+
+std::unique_ptr<Display> g_display;
+auto g_observer = std::make_shared<ai_vox::Observer>();
+auto g_audio_output_device = std::make_shared<ai_vox::AudioOutputDeviceI2sStd>(kSpeakerPinSck, kSpeakerPinWs, kSpeakerPinSd);
+button_handle_t g_button_boot_handle = nullptr;
+
+// ---------------- WS2812 灯控 ----------------
+
+led_strip_handle_t g_led_strip = nullptr;
+LedMode g_led_mode = LedMode::kOff;
+
+// ---------------- 指定灯亮 (self.led.pick) ----------------
+// 用一颗 bit 表示一颗灯是否被点名: bit0=RGB1 ... bit7=RGB8, 共 8 颗。
+// 用位图而不是 int 数组, 是因为"打开 3 6 8"这种需求天然就是"选中集合", 位图最直观,
+// 判断"某颗是否亮"只需 (mask >> i) & 1, 且一颗灯的开关就是一次按位或/与。
+uint8_t g_led_pick_mask = 0x00;  // 0 = 全部不亮
+
+// 点亮全部 8 颗为指定亮度(0~255)的白色: WS2812 无独立白光通道, R=G=B 即为白
+void LedShowWhite(uint8_t level) {
+  if (g_led_strip == nullptr) {
+    return;
+  }
+  for (uint32_t i = 0; i < kWs2812Count; ++i) {
+    ESP_ERROR_CHECK(led_strip_set_pixel(g_led_strip, i, level, level, level));
+  }
+  ESP_ERROR_CHECK(led_strip_refresh(g_led_strip));
+}
+
+// 熄灭: 发一帧全 0 把灯链置灭。
+// ★★ 2026-10-14 二次修正: 上一版改成了"连发 4 帧 + 帧间 delayMicroseconds(600)"，
+//   现【回退为单帧】。理由:
+//     · led_strip_clear() 发出的帧【本身就带合法的 reset code】
+//       (驱动内部 reset_code = 280us 低电平, 见 led_strip_rmt_encoder.c),
+//       所以单帧已经足够让灯珠正确锁存并复位, 不需要外部再补延时。
+//     · 帧间那 600us 是"人肉造"的 reset, 与驱动自己的 reset 叠加属于冗余;
+//       虽然无害, 但增加了我方代码出错的面(上一版的 pinMode 毛刺就是这么来的)。
+//     · 原则: 【时序交给驱动, 我方不做任何手动电平操作】。
+void LedShowOff() {
+  if (g_led_strip == nullptr) {
+    return;
+  }
+  ESP_ERROR_CHECK(led_strip_clear(g_led_strip));
+}
+
+// HSV -> RGB: h 为 0~255 的色相环(hue wheel), s/v 为 0~255 的饱和度/亮度
+// 说明: 用色相环而不是固定调色板, 8 颗灯珠可以拿到"连续渐变"的颜色, 像真正的彩虹流水
+static void HsvToRgb(uint8_t h, uint8_t s, uint8_t v, uint8_t& r, uint8_t& g, uint8_t& b) {
+  if (s == 0) {  // 饱和度为 0 → 灰/白
+    r = g = b = v;
+    return;
+  }
+  const uint8_t region = h / 43;               // 255/6 ≈ 42.5, 分成 6 个扇区
+  const uint8_t remainder = (h - region * 43) * 6;  // 扇区内插值 0~255
+  const uint8_t p = static_cast<uint8_t>((v * (255 - s)) >> 8);
+  const uint8_t q = static_cast<uint8_t>((v * (255 - ((s * remainder) >> 8))) >> 8);
+  const uint8_t t = static_cast<uint8_t>((v * (255 - ((s * (255 - remainder)) >> 8))) >> 8);
+  switch (region) {
+    case 0: r = v; g = t; b = p; break;
+    case 1: r = q; g = v; b = p; break;
+    case 2: r = p; g = v; b = t; break;
+    case 3: r = p; g = q; b = v; break;
+    case 4: r = t; g = p; b = v; break;
+    default: r = v; g = p; b = q; break;
+  }
+}
+
+// 跑马灯的一帧: 每颗灯珠取色相环上的一个点, 整条带子随时间滚动
+static void LedShowRainbowFrame(uint32_t tick) {
+  if (g_led_strip == nullptr) {
+    return;
+  }
+  // 每走一步(step), 色相整体前移一点 → 形成"流动"观感
+  const uint32_t step = tick / kRainbowStepMs;
+  const uint8_t base_hue = static_cast<uint8_t>((step * 8) & 0xFF);  // 每步整体转 8/256 圈
+  for (uint32_t i = 0; i < kWs2812Count; ++i) {
+    const uint8_t hue = static_cast<uint8_t>(base_hue + i * kRainbowHueStep);
+    uint8_t r = 0, g = 0, b = 0;
+    HsvToRgb(hue, 255, kRainbowLevel, r, g, b);
+    ESP_ERROR_CHECK(led_strip_set_pixel(g_led_strip, i, r, g, b));
+  }
+  ESP_ERROR_CHECK(led_strip_refresh(g_led_strip));
+}
+
+// 把 g_led_pick_mask 画到灯链上: 被点名的颗亮成 kCustomHue 色, 其余全灭。
+void LedShowPickMask() {
+  if (g_led_strip == nullptr) {
+    return;
+  }
+  uint8_t r = 0, g = 0, b = 0;
+  HsvToRgb(kCustomHue, 255, kCustomLevel, r, g, b);
+  for (uint32_t i = 0; i < kWs2812Count; ++i) {
+    if ((g_led_pick_mask >> i) & 0x01) {
+      ESP_ERROR_CHECK(led_strip_set_pixel(g_led_strip, i, r, g, b));
+    } else {
+      ESP_ERROR_CHECK(led_strip_set_pixel(g_led_strip, i, 0, 0, 0));
+    }
+  }
+  ESP_ERROR_CHECK(led_strip_refresh(g_led_strip));
+}
+
+// 单点跑马灯的一帧: 第 pos 颗最亮, 前一颗留一点余晖形成拖尾。
+static void LedShowChaseFrame(uint32_t pos) {
+  if (g_led_strip == nullptr) {
+    return;
+  }
+  uint8_t r = 0, g = 0, b = 0;
+  HsvToRgb(kCustomHue, 255, kCustomLevel, r, g, b);
+  uint8_t tr = 0, tg = 0, tb = 0;
+  HsvToRgb(kCustomHue, 255, kChaseTailLevel, tr, tg, tb);
+  const uint32_t head = pos % kWs2812Count;
+  const uint32_t tail = (pos + kWs2812Count - 1) % kWs2812Count;
+  for (uint32_t i = 0; i < kWs2812Count; ++i) {
+    if (i == head) {
+      ESP_ERROR_CHECK(led_strip_set_pixel(g_led_strip, i, r, g, b));
+    } else if (i == tail) {
+      ESP_ERROR_CHECK(led_strip_set_pixel(g_led_strip, i, tr, tg, tb));
+    } else {
+      ESP_ERROR_CHECK(led_strip_set_pixel(g_led_strip, i, 0, 0, 0));
+    }
+  }
+  ESP_ERROR_CHECK(led_strip_refresh(g_led_strip));
+}
+
+const char* LedModeName(LedMode mode) {
+  switch (mode) {
+    case LedMode::kOff: return "off";
+    case LedMode::kWhite: return "white";
+    case LedMode::kBreath: return "breath";
+    case LedMode::kRainbow: return "rainbow";
+    case LedMode::kChase: return "chase";
+    case LedMode::kCustom: return "custom";
+  }
+  return "unknown";
+}
+
+void LedSetMode(LedMode mode) {
+  g_led_mode = mode;
+  if (mode == LedMode::kOff) {
+    LedShowOff();
+  } else if (mode == LedMode::kWhite) {
+    LedShowWhite(kWhiteLevel);
+  } else if (mode == LedMode::kBreath) {
+    LedShowWhite(kBreathMinLevel);  // 呼吸由 loop 逐步刷新, 先给个起始值避免闪一下满亮
+  } else if (mode == LedMode::kRainbow) {
+    LedShowRainbowFrame(millis());  // 跑马灯由 loop 逐步刷新, 先画第一帧避免出现黑一下
+  } else if (mode == LedMode::kChase) {
+    LedShowChaseFrame(0);  // 单点跑马灯: 从第 1 颗起点开始, 由 loop 逐步推进
+  } else if (mode == LedMode::kCustom) {
+    LedShowPickMask();  // 指定灯亮: 立刻画出被点名的颗
+  }
+  printf("[LED] mode -> %s\n", LedModeName(mode));
+}
+
+// ★ 2026-10-14 上电自检: 逐颗点亮, 用于定位"某几颗灯不受控"的硬件故障。
+//   用途见 kWs2812SelfTest 的注释。每颗亮 300ms, 同时打印序号,
+//   方便对照"串口说第 N 颗亮"与"实际看到第几颗亮"是否一致。
+//   判读举例(以 8 颗灯链为例):
+//   - 串口打印到第 8 颗, 但眼睛只看到 4 颗亮 → RGB5~RGB8 有问题(断路/虚焊)
+//   - 串口打印到第 2 颗就停了 → 后面的灯珠把数据"吃掉"或数据线断在更前面
+void LedSelfTest() {
+  if (g_led_strip == nullptr) {
+    return;
+  }
+  printf("[LED] self-test start (expect %u leds light up one by one)\n", (unsigned)kWs2812Count);
+  for (uint32_t i = 0; i < kWs2812Count; ++i) {
+    ESP_ERROR_CHECK(led_strip_clear(g_led_strip));
+    // 点亮第 i 颗为白色(适度亮度, 避免刺眼)
+    ESP_ERROR_CHECK(led_strip_set_pixel(g_led_strip, i, 60, 60, 60));
+    ESP_ERROR_CHECK(led_strip_refresh(g_led_strip));
+    printf("[LED] self-test: led %u (0-based) should be ON\n", (unsigned)i);
+    delay(300);
+  }
+  ESP_ERROR_CHECK(led_strip_clear(g_led_strip));
+  delay(200);
+  printf("[LED] self-test done (all cleared)\n");
+}
+
+void InitWs2812() {
+  // ★★ 2026-10-14 重大修正: 【删除了原来在这里的 pinMode()+digitalWrite() 预拉低】
+  //
+  //   上一版为了"清掉上电伪数据"加了三行:
+  //       pinMode(kWs2812Pin, OUTPUT);
+  //       digitalWrite(kWs2812Pin, LOW);
+  //       delay(2);
+  //   结果反而【制造】了"通电后末尾两颗灯常亮"的故障 —— 元凶就是这里。
+  //
+  //   为什么加"拉低"反而坏事:
+  //     · ESP32-S3 的 pinMode() 把引脚切成 GPIO 输出模式时, IO MUX 重新映射
+  //       会产生一个几十 ns ~ 数 µs 的瞬态毛刺(高->低跳变)。
+  //     · WS2812 的判据是: 高 0.4us=bit0 / 高 0.8us=bit1 / 低 >50us=复位。
+  //       这个毛刺【之前没有 >50us 的复位低电平】, 所以被灯珠当成"数据帧"开始接收!
+  //     · 紧接着 delay(2) 的 2ms 低电平虽然产生了复位, 但毛刺已经被前几颗灯珠
+  //       吃掉若干 bit -> 后面灯珠数据错位 -> 表现为"末尾两颗亮"。
+  //     · 也就是说: 这段"加固"代码本身就是一个 WS2812 的非法时序发生器。
+  //
+  //   正确做法: 什么都别手动做, 交给 led_strip 驱动。
+  //     驱动在 led_strip_new_rmt_device() 里会正确配置 RMT 通道并接管该引脚,
+  //     它的 RMT 编码器本身就是合法的 WS2812 时序, 不会产生非法毛刺。
+  //     初始化完成后调 LedShowOff() 发合法帧即可把灯链置灭。
+  //
+  //   ★ 通用教训: 对 WS2812 这类"自定时协议"器件, 【任何手动 GPIO 操作都可能
+  //     被器件当成数据】。绝不要为了提高稳定性去手动翻转它的数据脚 —— 手动
+  //     操作越"精心", 制造非法时序的风险越大。
+
+  led_strip_config_t strip_config = {
+      .strip_gpio_num = static_cast<int>(kWs2812Pin),
+      .max_leds = kWs2812Count,
+      .led_model = LED_MODEL_WS2812,
+      .color_component_format = LED_STRIP_COLOR_COMPONENT_FMT_GRB,  // 板载 WS2812 数据顺序为 GRB
+      .flags = {.invert_out = false},
+  };
+
+  led_strip_rmt_config_t rmt_config = {
+      .clk_src = RMT_CLK_SRC_DEFAULT,
+      .resolution_hz = 10 * 1000 * 1000,  // 10MHz, WS2812 时序所需
+      .mem_block_symbols = 0,
+      .flags = {.with_dma = 0},
+  };
+
+  ESP_ERROR_CHECK(led_strip_new_rmt_device(&strip_config, &rmt_config, &g_led_strip));
+  LedShowOff();
+  printf("[LED] ws2812 init done: pin=%d, leds=%u\n", static_cast<int>(kWs2812Pin), static_cast<unsigned>(kWs2812Count));
+
+  // ★ 调试开关打开时跑逐颗自检(见 kWs2812SelfTest 注释)。验证完记得关掉。
+  if (kLedSelfTestOnBoot) {
+    LedSelfTest();
+  }
+}
+
+// 呼吸灯刷新: 由 loop 以约 20ms 周期调用, 用三角波把亮度在 min~max 之间来回推
+void LedBreathUpdate() {
+  if (g_led_mode != LedMode::kBreath) {
+    return;
+  }
+  static uint32_t s_last_tick = 0;
+  const uint32_t now = millis();
+  if (s_last_tick != 0 && now - s_last_tick < 20) {
+    return;  // 50Hz 刷新足够顺滑, 也不必让 RMT 太忙
+  }
+  s_last_tick = now;
+
+  const uint32_t phase = now % kBreathPeriodMs;                 // 0 ~ period
+  const uint32_t half = kBreathPeriodMs / 2;                    // 半周期
+  const uint32_t ramp = phase < half ? phase : kBreathPeriodMs - phase;  // 三角波 0 ~ half
+  const uint32_t span = kBreathMaxLevel - kBreathMinLevel;
+  const uint8_t level = static_cast<uint8_t>(kBreathMinLevel + ramp * span / half);
+  LedShowWhite(level);
+}
+
+// 跑马灯刷新: 由 loop 以约 20ms 周期调用, 每 kRainbowStepMs 推进一步
+// ★ 与呼吸灯同理, 必须走 loop 非阻塞轮询; 这里靠 s_last_step 记忆"上次画的是第几步",
+//   只有步号变化才真正推屏, 避免每 20ms 都重画同一帧白白占用 RMT 与 CPU
+void LedRainbowUpdate() {
+  if (g_led_mode != LedMode::kRainbow) {
+    return;
+  }
+  static uint32_t s_last_step = UINT32_MAX;
+  const uint32_t now = millis();
+  static uint32_t s_last_tick = 0;
+  if (s_last_tick != 0 && now - s_last_tick < 20) {
+    return;  // 50Hz 轮询足够, 真正推屏由步号变化控制
+  }
+  s_last_tick = now;
+
+  const uint32_t step = now / kRainbowStepMs;
+  if (step == s_last_step) {
+    return;  // 还没到下一步, 无需重画
+  }
+  s_last_step = step;
+  LedShowRainbowFrame(now);
+}
+
+// 单点跑马灯刷新: 由 loop 以约 20ms 周期调用, 每 kChaseStepMs 往前跑一颗。
+// ★ 同样走非阻塞轮询, 靠步号变化决定是否真推屏(与 LedRainbowUpdate 同套路)。
+void LedChaseUpdate() {
+  if (g_led_mode != LedMode::kChase) {
+    return;
+  }
+  static uint32_t s_last_step = UINT32_MAX;
+  const uint32_t now = millis();
+  static uint32_t s_last_tick = 0;
+  if (s_last_tick != 0 && now - s_last_tick < 20) {
+    return;
+  }
+  s_last_tick = now;
+
+  const uint32_t step = now / kChaseStepMs;
+  if (step == s_last_step) {
+    return;
+  }
+  s_last_step = step;
+  LedShowChaseFrame(step);
+}
+
+void InitDisplay() {
+  printf("init display\n");
+  pinMode(kDisplayBacklightPin, OUTPUT);
+  digitalWrite(kDisplayBacklightPin, HIGH);
+
+  spi_bus_config_t buscfg{
+      .mosi_io_num = kDisplayMosiPin,
+      .miso_io_num = GPIO_NUM_NC,
+      .sclk_io_num = kDisplayClkPin,
+      .quadwp_io_num = GPIO_NUM_NC,
+      .quadhd_io_num = GPIO_NUM_NC,
+      .data4_io_num = GPIO_NUM_NC,
+      .data5_io_num = GPIO_NUM_NC,
+      .data6_io_num = GPIO_NUM_NC,
+      .data7_io_num = GPIO_NUM_NC,
+      .data_io_default_level = false,
+      .max_transfer_sz = kDisplayWidth * kDisplayHeight * sizeof(uint16_t),
+      .flags = 0,
+      .isr_cpu_id = ESP_INTR_CPU_AFFINITY_AUTO,
+      .intr_flags = 0,
+  };
+  ESP_ERROR_CHECK(spi_bus_initialize(SPI3_HOST, &buscfg, SPI_DMA_CH_AUTO));
+
+  esp_lcd_panel_io_handle_t panel_io = nullptr;
+  esp_lcd_panel_handle_t panel = nullptr;
+
+  esp_lcd_panel_io_spi_config_t io_config = {};
+  io_config.cs_gpio_num = kDisplayCsPin;
+  io_config.dc_gpio_num = kDisplayDcPin;
+  io_config.spi_mode = kDisplaySpiMode;
+  io_config.pclk_hz = 20 * 1000 * 1000;  // 此类排线屏 40MHz 常不稳定, 先用 20MHz 点亮, 稳定后可尝试 40MHz
+  io_config.trans_queue_depth = 10;
+  io_config.lcd_cmd_bits = 8;
+  io_config.lcd_param_bits = 8;
+  ESP_ERROR_CHECK(esp_lcd_new_panel_io_spi(SPI3_HOST, &io_config, &panel_io));
+
+  esp_lcd_panel_dev_config_t panel_config = {};
+  panel_config.reset_gpio_num = kDisplayRstPin;
+  panel_config.rgb_ele_order = kDisplayRgbElementOrder;
+  panel_config.bits_per_pixel = 16;
+  ESP_ERROR_CHECK(esp_lcd_new_panel_st7789(panel_io, &panel_config, &panel));
+
+  esp_lcd_panel_reset(panel);
+  delay(120);  // 给 ST7789 上电稳定时间, 部分克隆芯片要求 reset 后至少等 120ms
+
+  esp_lcd_panel_init(panel);
+  esp_lcd_panel_invert_color(panel, kDisplayInvertColor);
+  esp_lcd_panel_swap_xy(panel, kDisplaySwapXY);
+  esp_lcd_panel_mirror(panel, kDisplayMirrorX, kDisplayMirrorY);
+
+  g_display = std::make_unique<Display>(panel_io, panel, kDisplayWidth, kDisplayHeight, 0, 0, kDisplayMirrorX, kDisplayMirrorY, kDisplaySwapXY);
+  g_display->Start();
+}
+
+#ifdef PRINT_HEAP_INFO_INTERVAL
+void PrintMemInfo() {
+  if (heap_caps_get_total_size(MALLOC_CAP_SPIRAM) > 0) {
+    const auto total_size = heap_caps_get_total_size(MALLOC_CAP_SPIRAM);
+    const auto free_size = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+    const auto min_free_size = heap_caps_get_minimum_free_size(MALLOC_CAP_SPIRAM);
+    printf("SPIRAM total size: %zu B (%zu KB), free size: %zu B (%zu KB), minimum free size: %zu B (%zu KB)\n",
+           total_size,
+           total_size >> 10,
+           free_size,
+           free_size >> 10,
+           min_free_size,
+           min_free_size >> 10);
+  }
+
+  if (heap_caps_get_total_size(MALLOC_CAP_INTERNAL) > 0) {
+    const auto total_size = heap_caps_get_total_size(MALLOC_CAP_INTERNAL);
+    const auto free_size = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+    const auto min_free_size = heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL);
+    printf("IRAM total size: %zu B (%zu KB), free size: %zu B (%zu KB), minimum free size: %zu B (%zu KB)\n",
+           total_size,
+           total_size >> 10,
+           free_size,
+           free_size >> 10,
+           min_free_size,
+           min_free_size >> 10);
+  }
+
+  if (heap_caps_get_total_size(MALLOC_CAP_DEFAULT) > 0) {
+    const auto total_size = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
+    const auto free_size = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    const auto min_free_size = heap_caps_get_minimum_free_size(MALLOC_CAP_DEFAULT);
+    printf("DRAM total size: %zu B (%zu KB), free size: %zu B (%zu KB), minimum free size: %zu B (%zu KB)\n",
+           total_size,
+           total_size >> 10,
+           free_size,
+           free_size >> 10,
+           min_free_size,
+           min_free_size >> 10);
+  }
+}
+#endif
+
+void PlayMp3(const uint8_t* data, size_t size) {
+  auto ret = esp_mp3_dec_register();
+  if (ret != ESP_AUDIO_ERR_OK) {
+    printf("Failed to register mp3 decoder: %d\n", ret);
+    abort();
+  }
+
+  esp_audio_simple_dec_handle_t decoder = nullptr;
+  esp_audio_simple_dec_cfg_t audio_dec_cfg{
+      .dec_type = ESP_AUDIO_SIMPLE_DEC_TYPE_MP3,
+      .dec_cfg = nullptr,
+      .cfg_size = 0,
+  };
+  ret = esp_audio_simple_dec_open(&audio_dec_cfg, &decoder);
+  if (ret != ESP_AUDIO_ERR_OK) {
+    printf("Failed to open mp3 decoder: %d\n", ret);
+    abort();
+  }
+  g_audio_output_device->OpenOutput(16000);
+
+  esp_audio_simple_dec_raw_t raw = {
+      .buffer = const_cast<uint8_t*>(data),
+      .len = size,
+      .eos = true,
+      .consumed = 0,
+      .frame_recover = ESP_AUDIO_SIMPLE_DEC_RECOVERY_NONE,
+  };
+
+  uint8_t* frame_data = (uint8_t*)malloc(4096);
+  esp_audio_simple_dec_out_t out_frame = {
+      .buffer = frame_data,
+      .len = 4096,
+      .needed_size = 0,
+      .decoded_size = 0,
+  };
+
+  while (raw.len > 0) {
+    const auto ret = esp_audio_simple_dec_process(decoder, &raw, &out_frame);
+    if (ret == ESP_AUDIO_ERR_BUFF_NOT_ENOUGH) {
+      // Handle output buffer not enough case
+      out_frame.buffer = reinterpret_cast<uint8_t*>(realloc(out_frame.buffer, out_frame.needed_size));
+      if (out_frame.buffer == nullptr) {
+        break;
+      }
+      out_frame.len = out_frame.needed_size;
+      continue;
+    }
+
+    if (ret != ESP_AUDIO_ERR_OK) {
+      break;
+    }
+
+    g_audio_output_device->Write(reinterpret_cast<int16_t*>(out_frame.buffer), out_frame.decoded_size >> 1);
+    raw.len -= raw.consumed;
+    raw.buffer += raw.consumed;
+  }
+
+  free(frame_data);
+
+  g_audio_output_device->CloseOutput();
+  esp_audio_simple_dec_close(decoder);
+  esp_audio_dec_unregister(ESP_AUDIO_TYPE_MP3);
+}
+
+void ConfigureWifi() {
+  printf("configure wifi\n");
+  auto wifi_configurator = std::make_unique<WifiConfigurator>(WiFi, kSmartConfigType);
+
+  ESP_ERROR_CHECK(iot_button_register_cb(
+      g_button_boot_handle,
+      BUTTON_PRESS_DOWN,
+      nullptr,
+      [](void*, void* data) {
+        printf("boot button pressed\n");
+        static_cast<WifiConfigurator*>(data)->StartSmartConfig();
+      },
+      wifi_configurator.get()));
+
+  g_display->ShowStatus("网络配置中");
+  PlayMp3(kNotification0mp3, sizeof(kNotification0mp3));
+
+#if defined(WIFI_SSID) && defined(WIFI_PASSWORD)
+  printf("wifi config start with wifi: %s, %s\n", WIFI_SSID, WIFI_PASSWORD);
+  wifi_configurator->Start(WIFI_SSID, WIFI_PASSWORD);
+#else
+  printf("wifi config start\n");
+  wifi_configurator->Start();
+#endif
+
+  while (true) {
+    const auto state = wifi_configurator->WaitStateChanged();
+    if (state == WifiConfigurator::State::kConnecting) {
+      printf("wifi connecting\n");
+      g_display->ShowStatus("网络连接中");
+    } else if (state == WifiConfigurator::State::kSmartConfiguring) {
+      printf("wifi smart configuring\n");
+      g_display->ShowStatus("配网模式");
+      PlayMp3(kNetworkConfigModeMp3, sizeof(kNetworkConfigModeMp3));
+    } else if (state == WifiConfigurator::State::kFinished) {
+      break;
+    }
+  }
+
+  iot_button_unregister_cb(g_button_boot_handle, BUTTON_PRESS_DOWN, nullptr);
+
+  printf("wifi connected\n");
+  printf("- mac address: %s\n", WiFi.macAddress().c_str());
+  printf("- bssid:       %s\n", WiFi.BSSIDstr().c_str());
+  printf("- ssid:        %s\n", WiFi.SSID().c_str());
+  printf("- ip:          %s\n", WiFi.localIP().toString().c_str());
+  printf("- gateway:     %s\n", WiFi.gatewayIP().toString().c_str());
+  printf("- subnet mask: %s\n", WiFi.subnetMask().toString().c_str());
+
+  g_display->ShowStatus("网络已连接");
+  PlayMp3(kNetworkConnectedMp3, sizeof(kNetworkConnectedMp3));
+
+  // ---------- NTP 对时 (屏保时钟用) ----------
+  // 时区 UTC+8 (中国标准时间), 无夏令时
+  // 注意: 这里只是"发起"同步, 函数立即返回, 后台 SNTP 任务会去取时间
+  //       取到之前 time() 返回很小的值(1970 附近), 屏保会显示"对时中..."且数码管熄灭
+  // 用 2 个国内可达的 NTP 服务器, 避免单点失败
+  constexpr long kTimeZoneOffsetSec = 8 * 3600;  // UTC+8
+  configTime(kTimeZoneOffsetSec, 0, "ntp.aliyun.com", "cn.pool.ntp.org");
+  printf("[TIME] ntp sync started (UTC+8)\n");
+}
+
+// ---------------- 环境传感器: AHT20(温湿度) + BMP280(气压) ----------------
+// 接线(用户 2026-10-14 接线图): AHT20 模块 4 针 = 3V3 / IO41 / GND / IO42
+//   即 I2C: SDA=IO41, SCL=IO42。BMP280 挂同一条总线(地址 0x76 或 0x77)。
+// AHT20 地址固定 0x38; BMP280 地址由 SDO 引脚电平决定: GND=0x76, VCC=0x77。
+// 传感器不存在时不阻塞不报错, 只是 MCP 查询时告知"未连接"。
+static Adafruit_AHTX0 g_aht;
+static Adafruit_BMP280 g_bmp;
+static bool g_aht_ok = false;
+static bool g_bmp_ok = false;
+// 最近一次读数(loop 单线程读、单线程用, 无需加锁)
+static float g_env_temp_c = 0.0f;    // °C
+static float g_env_hum = 0.0f;       // %RH
+static float g_env_press_hpa = 0.0f; // hPa
+static bool g_env_valid = false;
+static uint32_t g_env_last_read_ms = 0;
+// 3 秒读一次: AHT20 测一次约需 80ms, 不能太密; 3s 对环境变化足够快
+static constexpr uint32_t kEnvReadIntervalMs = 3000;
+
+void InitSensors() {
+  constexpr int kI2cSdaPin = 41;
+  constexpr int kI2cSclPin = 42;
+  Wire.begin(kI2cSdaPin, kI2cSclPin);
+  Wire.setClock(100000);  // 100kHz 标准模式, AHT20 稳妥
+
+  // AHT20: 默认地址 0x38
+  g_aht_ok = g_aht.begin(&Wire);
+  printf("[Sensor] AHT20: %s\n", g_aht_ok ? "OK (0x38)" : "NOT FOUND (check wiring/power)");
+
+  // BMP280: 先试 0x76(SDO=GND) 再试 0x77(SDO=VCC)
+  // ★ begin(addr, chipid) 没有 Wire 参数 —— Wire 是构造函数绑定的(默认 &Wire),
+  //   不能写成 g_bmp.begin(0x76, &Wire), 会编译错。
+  uint8_t bmp_addr = 0;
+  if (g_bmp.begin(BMP280_ADDRESS_ALT)) {  // ALT = 0x76
+    bmp_addr = BMP280_ADDRESS_ALT;
+  } else if (g_bmp.begin(BMP280_ADDRESS)) {  // 默认 = 0x77
+    bmp_addr = BMP280_ADDRESS;
+  }
+  g_bmp_ok = (bmp_addr != 0);
+  if (g_bmp_ok) {
+    // 正常连续测量模式: 温度 x2 / 气压 x16 过采样 + 重滤波, 数据稳
+    g_bmp.setSampling(Adafruit_BMP280::MODE_NORMAL,
+                      Adafruit_BMP280::SAMPLING_X2,
+                      Adafruit_BMP280::SAMPLING_X16,
+                      Adafruit_BMP280::FILTER_X16,
+                      Adafruit_BMP280::STANDBY_MS_63);
+    printf("[Sensor] BMP280: OK (0x%02X)\n", bmp_addr);
+  } else {
+    printf("[Sensor] BMP280: NOT FOUND (0x76/0x77 both missed)\n");
+  }
+}
+
+// 由 loop() 周期调用: 到点就读一轮传感器, 更新缓存
+void SensorPoll() {
+  const uint32_t now = millis();
+  if (g_env_last_read_ms != 0 && now - g_env_last_read_ms < kEnvReadIntervalMs) {
+    return;
+  }
+  g_env_last_read_ms = now;
+
+  bool any_ok = false;
+  if (g_aht_ok) {
+    sensors_event_t hum_event, temp_event;
+    if (g_aht.getEvent(&hum_event, &temp_event)) {
+      g_env_temp_c = temp_event.temperature;
+      g_env_hum = hum_event.relative_humidity;
+      any_ok = true;
+    }
+  }
+  if (g_bmp_ok) {
+    // readPressure() 返回 Pa, 除以 100 转 hPa(百帕, 与天气预报同单位)
+    g_env_press_hpa = g_bmp.readPressure() / 100.0f;
+    any_ok = true;
+  }
+  g_env_valid = any_ok;
+  if (any_ok) {
+    printf("[Env] T=%.1fC H=%.1f%% P=%.1fhPa\n", g_env_temp_c, g_env_hum, g_env_press_hpa);
+  }
+}
+
+// ================== 板间串口通讯实现 (UART1, 39/40) ==================
+// 协议: 【行协议】—— 以 '\n'(或 '\r') 作为一帧结束符, 帧内是任意 UTF-8 文本。
+//   为什么用行协议而不是"帧头 + 长度 + CRC"的二进制帧:
+//     · 串口助手 / 示波器 / 另一块板的终端都能直接肉眼看清内容, 调试成本最低;
+//     · 两端都是自己写的固件, 走的是短距 TTL 直连, 误码率极低, 不需要重装甲;
+//     · 以后真要传二进制结构体, 再升级成二进制帧也不迟(改这一个文件即可)。
+//   兼容性: 对方若【不带换行】也能收到 —— 靠 kLinkFrameIdleMs 空闲超时兜底。
+
+// ---- 接收状态(组帧缓冲 + "最近一行"缓存) ----
+char g_link_rx_buf[192] = {0};         // 收满一行前的临时缓冲
+size_t g_link_rx_len = 0;              // 缓冲内已有字节数
+uint32_t g_link_rx_first_byte_ms = 0;  // 本帧第一个字节到达时刻(用于空闲超时判定)
+char g_link_last_line[192] = {0};      // 最近收到的完整一行(供 MCP 工具读取 / 给 AI 看)
+bool g_link_has_line = false;          // 是否收到过任何一行
+uint32_t g_link_last_rx_ms = 0;        // 最近一次收帧时刻(诊断用)
+
+void InitSerialLink() {
+  // ★ 参数顺序: begin(baud, config, rxPin, txPin) —— 注意 rx 在前, tx 在后!
+  g_link_serial.begin(kLinkBaud, SERIAL_8N1, kLinkRxPin, kLinkTxPin);
+  g_link_serial.setTimeout(20);
+  printf("[Link] uart1 ready: TX=%d RX=%d baud=%u (3.3V TTL; 交叉接线 + 必须共地)\n",
+         static_cast<int>(kLinkTxPin), static_cast<int>(kLinkRxPin), (unsigned)kLinkBaud);
+}
+
+// 通过串口发一行(自动补 '\n')。供 MCP 工具 self.serial.send 调用。
+void LinkSendLine(const char* text) {
+  if (text == nullptr) {
+    return;
+  }
+  g_link_serial.print(text);
+  g_link_serial.print('\n');
+  g_link_serial.flush();  // 等发送移位寄存器排空再返回, 保证"说发出去了"就是真发出去了
+  printf("[Link] TX >> %s\n", text);
+}
+
+// 把收到的一行存入缓存并打印日志。how 说明是"怎么判定这一帧结束的", 便于排障。
+static void LinkCommitLine(const char* line, const char* how) {
+  if (line == nullptr || line[0] == '\0') {
+    return;
+  }
+  snprintf(g_link_last_line, sizeof(g_link_last_line), "%s", line);
+  g_link_has_line = true;
+  g_link_last_rx_ms = millis();
+  printf("[Link] RX << %s  (frame end: %s)\n", g_link_last_line, how);
+}
+
+// 主循环轮询: 非阻塞地收字节, 按 '\n' 组帧; 无换行则靠空闲超时提交。
+// ★ 全程不阻塞、不 delay, 不会拖慢语音响应(这是把它放 loop 的前提)。
+void SerialLinkPoll() {
+  const uint32_t now = millis();
+
+  while (g_link_serial.available() > 0) {
+    const int c = g_link_serial.read();
+    if (c < 0) {
+      break;
+    }
+    if (c == '\n' || c == '\r') {
+      if (g_link_rx_len > 0) {
+        g_link_rx_buf[g_link_rx_len] = '\0';
+        LinkCommitLine(g_link_rx_buf, "newline");
+        g_link_rx_len = 0;
+        g_link_rx_buf[0] = '\0';
+      }
+      continue;
+    }
+    if (g_link_rx_len == 0) {
+      g_link_rx_first_byte_ms = now;
+    }
+    if (g_link_rx_len < sizeof(g_link_rx_buf) - 1) {
+      g_link_rx_buf[g_link_rx_len++] = static_cast<char>(c);
+    } else {
+      // 缓冲溢出: 把已收到的部分当一帧交出去再重置, 避免"死等换行"把后续数据一起吞掉
+      g_link_rx_buf[g_link_rx_len] = '\0';
+      LinkCommitLine(g_link_rx_buf, "overflow-truncated");
+      g_link_rx_len = 0;
+      g_link_rx_buf[0] = '\0';
+    }
+  }
+
+  // 空闲超时提交: 对端发的内容不带换行时也能收到(短帧/单次发送场景)
+  if (g_link_rx_len > 0 && (now - g_link_rx_first_byte_ms) >= kLinkFrameIdleMs) {
+    g_link_rx_buf[g_link_rx_len] = '\0';
+    LinkCommitLine(g_link_rx_buf, "idle-timeout");
+    g_link_rx_len = 0;
+    g_link_rx_buf[0] = '\0';
+  }
+}
+
+// ================== 三路舵机 (IO12/13/14, LEDC 50Hz) ==================
+// 标准 RC 舵机: 50Hz PWM, 脉宽 500us~2500us 对应 0~180 度。
+// core 3.x API: ledcAttach(pin, freq, resolution) + ledcWrite(pin, duty)。
+// 14bit 分辨率下 20ms/16384 ≈ 1.22us/tick, 500us->duty 410, 2500us->duty 2048。
+// ★ 自检动作是"长动作"(好几秒), 绝不能在 MCP 回调里 delay(会卡语音/屏保/串口),
+//   一律用非阻塞状态机放 loop 里轮询。
+
+constexpr gpio_num_t kServoPins[3] = {GPIO_NUM_12, GPIO_NUM_13, GPIO_NUM_14};
+constexpr uint32_t kServoFreqHz = 50;
+constexpr uint8_t kServoResBits = 14;
+
+struct ServoCtl {
+  int angle;         // 当前角度(0~180)
+  bool testing;      // 自检进行中
+  int phase;         // 0..4=waypoints{45,90,135,180,0}各停700ms; 5=平滑扫描0->180; 6=完成
+  uint32_t next_ms;  // 下一次动作的时刻
+};
+ServoCtl g_servos[3];
+
+// 角度 -> LEDC duty
+static inline uint32_t ServoAngleToDuty(int angle) {
+  if (angle < 0) angle = 0;
+  if (angle > 180) angle = 180;
+  const uint32_t us = 500 + (static_cast<uint32_t>(angle) * 2000) / 180;  // 500~2500us
+  return (us * 16384) / 20000;
+}
+
+static void ServoWriteAngle(int idx, int angle) {
+  if (idx < 0 || idx >= 3) return;
+  if (angle < 0) angle = 0;
+  if (angle > 180) angle = 180;
+  ledcWrite(static_cast<uint8_t>(kServoPins[idx]), ServoAngleToDuty(angle));
+  g_servos[idx].angle = angle;
+}
+
+void InitServos() {
+  for (int i = 0; i < 3; i++) {
+    ledcAttach(static_cast<uint8_t>(kServoPins[i]), kServoFreqHz, kServoResBits);
+    g_servos[i].testing = false;
+    g_servos[i].phase = 0;
+    g_servos[i].next_ms = 0;
+    ServoWriteAngle(i, 0);  // 上电归 0 度
+  }
+  printf("[Servo] 3 servos ready on IO12/13/14 (50Hz, 500-2500us -> 0-180deg)\n");
+}
+
+// 启动某一舵机的自检序列(异步, 立即返回):
+// 先回 0 度 -> 45 -> 90 -> 135 -> 180 -> 回 0, 每步停 700ms;
+// 然后从 0 度平滑扫到 180 度(每 20ms 走 1 度, 约 3.6s), 结束停在 180 度。
+static void ServoStartSelftest(int idx) {
+  ServoWriteAngle(idx, 0);           // 先初始化到 0 度
+  g_servos[idx].testing = true;
+  g_servos[idx].phase = 0;
+  g_servos[idx].next_ms = millis() + 700;
+}
+
+// 非阻塞自检状态机, loop 里每圈调用
+void ServoPoll() {
+  const uint32_t now = millis();
+  static constexpr int kWaypoints[5] = {45, 90, 135, 180, 0};
+  static constexpr uint32_t kStepHoldMs = 700;
+  static constexpr uint32_t kSweepStepMs = 20;  // 平滑扫描步进间隔
+
+  for (int i = 0; i < 3; i++) {
+    ServoCtl& s = g_servos[i];
+    if (!s.testing) continue;
+    if (static_cast<int32_t>(now - s.next_ms) < 0) continue;
+
+    if (s.phase < 5) {
+      // 阶段一: 逐点 45/90/135/180/0, 每步停 700ms
+      ServoWriteAngle(i, kWaypoints[s.phase]);
+      s.phase++;
+      s.next_ms = now + kStepHoldMs;
+      if (s.phase == 5) {
+        // 五个点走完, 此时舵机在 0 度; 直接开始平滑扫描
+        s.angle = 0;
+        s.next_ms = now + kStepHoldMs;
+      }
+    } else if (s.phase == 5) {
+      // 阶段二: 0 -> 180 平滑扫描, 每 20ms +1 度
+      if (s.angle < 180) {
+        ServoWriteAngle(i, s.angle + 1);
+        s.next_ms = now + kSweepStepMs;
+      } else {
+        s.phase = 6;
+        s.testing = false;  // 自检完成, 停在 180 度
+        printf("[Servo] servo%d selftest done (rest at 180deg)\n", i + 1);
+      }
+    }
+  }
+}
+
+void InitMcpTools() {
+  auto& engine = ai_vox::Engine::GetInstance();
+  engine.AddMcpTool("self.audio_speaker.set_volume",         // tool name
+                    "Set the volume of the audio speaker.",  // tool description
+                    {
+                        {
+                            "volume",  // parameter name
+
+                            ai_vox::ParamSchema<int64_t>{
+                                // parameter type can be bool, std::string or int64_t
+                                .default_value = std::nullopt,  // default value, set to std::nullopt if not specified
+                                .min = 0,                       // minimum value, set to std::nullopt if not specified
+                                .max = 100,                     // maximum value, set to std::nullopt if not specified
+                            },
+                        },
+                        // add more parameter schema as needed
+                    }  // parameter schema
+  );
+
+  engine.AddMcpTool("self.audio_speaker.get_volume",         // tool name
+                    "Get the volume of the audio speaker.",  // tool description
+                    {
+                        // empty
+                    }  // parameter schema
+  );
+
+  engine.AddMcpTool("self.led.set",
+                    "控制设备 RGB 灯链(共 8 颗, 同步显示)。可选模式: "
+                    "'white' 表示开启并常亮白色灯光(用户说 '开灯'、'打开灯'、'把灯打开'、'打开白灯' 时使用); "
+                    "'breath' 表示开启呼吸灯效果(用户说 '呼吸灯'、'打开呼吸灯'、'来个呼吸效果' 时使用); "
+                    "'rainbow' 表示开启彩色彩虹流水灯效果(用户说 '打开彩灯'、'开彩灯'、'彩色灯'、'彩虹灯'、'流光' 时使用); "
+                    "'chase' 表示开启单点跑马灯效果 —— 一颗亮点在 8 颗灯上循环跑动(用户说 '跑马灯'、'跑马灯效果'、"
+                    "'流水灯'、'来一个跑马灯'、'灯跑起来' 时使用); "
+                    "'off' 表示关灯(用户说 '关灯'、'把灯关掉' 时使用)。"
+                    "注意: 若用户说的是'打开第N个灯'、'点亮第3个灯'、'打开3 6 8号灯'这类点名具体灯珠的需求, "
+                    "请不要用本工具, 改用 self.led.pick。",
+                    {
+                        {
+                            "mode",  // parameter name
+                            ai_vox::ParamSchema<std::string>{
+                                // parameter type can be bool, std::string or int64_t
+                                .default_value = std::nullopt,  // default value, set to std::nullopt if not specified
+                            },                                  // parameter type
+                        },
+                        // add more parameter schema as needed
+                    }  // parameter schema
+  );
+
+  engine.AddMcpTool("self.led.pick",
+                    "点亮灯链上【指定的若干颗】灯(共 8 颗, 编号 1~8), 其余灯熄灭。"
+                    "参数 leds 是被点亮的灯号列表, 用英文逗号分隔, 例如 '3' 表示只亮第 3 颗, "
+                    "'3,6,8' 表示同时亮第 3、6、8 颗; 传 '0' 或空字符串表示全部熄灭。"
+                    "当用户说'打开第3个灯'、'点亮第3个灯'、'把第3个灯打开'、'打开3 6 8号灯'、"
+                    "'3号6号8号灯亮'、'只开第5盏灯'、'点亮 1 和 4' 等点名具体灯珠的指令时调用本工具。"
+                    "★ 与 self.led.set 的区别: 本工具是'点名哪几颗亮哪几颗', self.led.set 是'整条链一起变色'。",
+                    {
+                        {
+                            "leds",
+                            ai_vox::ParamSchema<std::string>{
+                                .default_value = std::nullopt,
+                            },
+                        },
+                    }  // parameter schema
+  );
+
+  engine.AddMcpTool("self.led.get",
+                    "获取设备 RGB 灯链的当前状态, 返回 'off'、'white'、'breath'、'rainbow'、'chase' 或 'custom'。",
+                    {
+                        // empty
+                    }  // parameter schema
+  );
+
+  // ---------------- 环境传感器 MCP 工具 (语音查询温湿度气压) ----------------
+  // ★ 为什么要拆成 4 个工具而不是 1 个"返回全部"的工具:
+  //   只给 1 个返回三个值的工具, 用户问"温度多少"时, 大模型拿到三个数可能
+  //   全报一遍、也可能只报一个 —— 取决于临场发挥, 不够稳。
+  //   拆成单项工具后, 描述里写死"只问一项就调对应单项工具",
+  //   问什么答什么, 输出确定。
+  // ★ 数据来源: 全部读 SensorPoll() 每 3 秒刷新的缓存, 不在回调里现场读
+  //   (AHT20 一次测量约 80ms, 现场读会拖慢语音响应)。
+
+  // 综合查询: 用户一次问多项或笼统问"环境怎么样"时用
+  engine.AddMcpTool("self.sensor.get_environment",
+                    "获取当前环境的全部读数(温度、湿度、气压三个值一起返回)。"
+                    "仅当用户一次性询问多个环境数据、或笼统地问'环境怎么样'、'现在环境如何'时使用。"
+                    "如果用户只问其中一项(例如只问温度), 请改用对应的单项工具 "
+                    "self.sensor.get_temperature / self.sensor.get_humidity / self.sensor.get_pressure。"
+                    "返回形如 '温度 25.3°C, 湿度 46%, 气压 1008.2 hPa' 的文本。",
+                    {
+                        // empty
+                    }  // parameter schema
+  );
+
+  // 单项: 温度
+  engine.AddMcpTool("self.sensor.get_temperature",
+                    "获取当前环境温度。当用户询问'现在温度多少'、'多少度'、'屋里几度'、"
+                    "'热不热'、'冷不冷'、'温度' 等只涉及温度的问题时使用。"
+                    "返回形如 '25.3 摄氏度' 的文本。",
+                    {
+                        // empty
+                    }  // parameter schema
+  );
+
+  // 单项: 湿度
+  engine.AddMcpTool("self.sensor.get_humidity",
+                    "获取当前环境湿度。当用户询问'现在湿度多少'、'湿度'、'潮不潮'、"
+                    "'干不干'、'空气湿度' 等只涉及湿度的问题时使用。"
+                    "返回形如 '46%' 的文本。",
+                    {
+                        // empty
+                    }  // parameter schema
+  );
+
+  // 单项: 气压
+  engine.AddMcpTool("self.sensor.get_pressure",
+                    "获取当前大气气压。当用户询问'现在气压多少'、'气压'、'大气压'、"
+                    "'海拔' 等只涉及气压的问题时使用。"
+                    "返回形如 '1008.2 百帕' 的文本。",
+                    {
+                        // empty
+                    }  // parameter schema
+  );
+
+  // ---------------- 屏幕控制 MCP 工具 (语音进/出屏保) ----------------
+  // ★ 用户 2026-10-14 需求: "当听到待机、退出、锁屏之类的词语, 直接进入屏保显示"。
+  // ★ 为什么用 MCP 工具而不是在固件里做关键词匹配:
+  //   语音的识别、分词、近义表达(睡觉/休眠/黑屏/关屏…)交给云端大模型判断,
+  //   固件只负责"被调用就进屏保"这一个动作。这样新增同义词不用改固件、不用重烧。
+  engine.AddMcpTool("self.display.sleep",
+                    "让设备屏幕进入待机/屏保状态(显示大时钟+日期+温湿度)。"
+                    "当用户说'待机'、'进入待机'、'退出'、'锁屏'、'息屏'、'休眠'、"
+                    "'睡觉'、'关屏'、'黑屏'、'进入屏保'、'休息' 等【要求屏幕关闭或待机】"
+                    "的意思时调用。注意: 这是关闭屏幕显示, 不是关机、不是断开网络。"
+                    "调用成功后请简短地回复用户, 例如'好的, 已进入待机'。",
+                    {
+                        // empty
+                    }  // parameter schema
+  );
+
+  engine.AddMcpTool("self.display.wake",
+                    "把设备屏幕从待机/屏保状态唤醒, 恢复到正常的对话界面。"
+                    "当用户说'唤醒'、'亮屏'、'打开屏幕'、'退出屏保'、'回来' 等"
+                    "【要求屏幕恢复显示】的意思时调用。",
+                    {
+                        // empty
+                    }  // parameter schema
+  );
+
+  // ---------------- 板间串口通讯 MCP 工具 (IO39/IO40, UART1) ----------------
+  // ★ 面向"另一块单片机/开发板"的通讯, 不是给用户朗读的。
+  //   典型链路: 用户说"通知另一块板打开水泵" → AI 调 self.serial.send("PUMP_ON")
+  //            → 本机从 IO39 发出 → 对方板收到并执行。
+  engine.AddMcpTool("self.serial.send",
+                    "通过预留串口(IO39/IO40, UART1)向【另一块单片机/开发板】发送一行文本指令。"
+                    "当用户要求把某个指令、命令或消息转发给另一块板子时调用, 例如"
+                    "'告诉另一块板打开水泵'、'通知从机开始采集'、'给对面发 xxx'、'让从机重启'。"
+                    "参数 text 是要发送的文本内容(不需要自己加换行, 本工具会自动补一个换行)。"
+                    "注意: 这不是朗读给用户听, 而是发给外接的单片机。",
+                    {
+                        {
+                            "text",
+                            ai_vox::ParamSchema<std::string>{
+                                .default_value = std::nullopt,
+                            },
+                        },
+                    }  // parameter schema
+  );
+
+  engine.AddMcpTool("self.serial.get_last",
+                    "读取【另一块单片机/开发板】最近通过串口发来的一行文本。"
+                    "当用户询问'另一块板说了什么'、'有没有收到从机的数据'、'串口收到什么了'、"
+                    "'对面发来什么' 等需要查看串口接收内容的问题时调用。"
+                    "若至今还没收到任何数据, 工具会返回错误提示。",
+                    {
+                        // empty
+                    }  // parameter schema
+  );
+
+  engine.AddMcpTool("self.servo.set",
+                    "控制三路舵机中的一路转到指定角度。"
+                    "舵机1 接在 IO12, 舵机2 接在 IO13, 舵机3 接在 IO14。"
+                    "当用户说'舵机1 转到30度'、'舵机2 转到69度'、'舵机三转到90度'、"
+                    "'舵机1 回到0度'、'转动2号舵机到120度' 等舵机转向指令时调用。"
+                    "参数 servo 是舵机编号(1~3), 参数 angle 是目标角度(0~180, 整数)。",
+                    {
+                        {
+                            "servo",
+                            ai_vox::ParamSchema<int64_t>{
+                                .default_value = std::nullopt,
+                            },
+                        },
+                        {
+                            "angle",
+                            ai_vox::ParamSchema<int64_t>{
+                                .default_value = std::nullopt,
+                            },
+                        },
+                    }  // parameter schema
+  );
+
+  engine.AddMcpTool("self.servo.selftest",
+                    "让三路舵机中的一路执行硬件自检动作: 先回0度, 再依次转到45度、90度、135度、180度, "
+                    "然后回到0度, 最后从0度缓慢平滑地转向180度, 用于检测舵机硬件是否正常。"
+                    "当用户说'舵机1 自检一下硬件是否正常'、'舵机二自检'、'舵机3 检测一下' 等时调用。"
+                    "自检是异步执行的, 调用后立即返回'自检已开始', 动作会持续几秒钟。"
+                    "参数 servo 是舵机编号(1~3)。",
+                    {
+                        {
+                            "servo",
+                            ai_vox::ParamSchema<int64_t>{
+                                .default_value = std::nullopt,
+                            },
+                        },
+                    }  // parameter schema
+  );
+}
+}  // namespace
+
+void setup() {
+  Serial.begin(115200);
+  printf("setup\n");
+
+  // 板载 WS2812: 初始化后保持熄灭, 等语音指令
+  InitWs2812();
+
+  printf("init button\n");
+  const button_config_t btn_cfg = {
+      .long_press_time = 1000,
+      .short_press_time = 50,
+  };
+
+  const button_gpio_config_t gpio_cfg = {
+      .gpio_num = kButtonBoot,
+      .active_level = 0,
+      .enable_power_save = false,
+      .disable_pull = false,
+  };
+
+  ESP_ERROR_CHECK(iot_button_new_gpio_device(&btn_cfg, &gpio_cfg, &g_button_boot_handle));
+
+  InitDisplay();
+  g_display->ShowStatus("初始化");
+
+  // 环境传感器 (AHT20 温湿度 + BMP280 气压, I2C: SDA=IO41 SCL=IO42)
+  // 放在 WiFi 之前: I2C 初始化不依赖网络, 失败也只打印日志不阻塞
+  InitSensors();
+
+  // 板间串口通讯 (UART1: TX=IO39, RX=IO40), 与另一块 ESP32/S3 点对点相连。
+  // 这里只是把 UART 通道开好; 接收在 loop() 里非阻塞轮询(SerialLinkPoll)
+  InitSerialLink();
+  InitServos();
+
+  ConfigureWifi();
+
+  InitMcpTools();
+
+#if AUDIO_INPUT_DEVICE_TYPE == AUDIO_INPUT_DEVICE_TYPE_I2S_STD
+  auto audio_input_device = std::make_shared<ai_vox::AudioInputDeviceI2sStd>(kMicPinSck, kMicPinWs, kMicPinSd);
+#elif AUDIO_INPUT_DEVICE_TYPE == AUDIO_INPUT_DEVICE_TYPE_PDM
+  auto audio_input_device = std::make_shared<ai_vox::PdmAudioInputDevice>(kMicPinSck, kMicPinSd);
+#endif
+
+  auto& ai_vox_engine = ai_vox::Engine::GetInstance();
+  ai_vox_engine.SetObserver(g_observer);
+  ai_vox_engine.SetOtaUrl("https://api.tenclass.net/xiaozhi/ota/");
+  ai_vox_engine.ConfigWebsocket("wss://api.tenclass.net/xiaozhi/v1/",
+                                {
+                                    {"Authorization", "Bearer test-token"},
+                                });
+  printf("engine starting\n");
+  g_display->ShowStatus("AI引擎启动中");
+
+  ai_vox_engine.Start(audio_input_device, g_audio_output_device);
+
+  printf("engine started\n");
+
+  ESP_ERROR_CHECK(iot_button_register_cb(
+      g_button_boot_handle,
+      BUTTON_PRESS_DOWN,
+      nullptr,
+      [](void* button_handle, void* usr_data) {
+        printf("boot button pressed\n");
+        // 按键是最明确的人工唤醒: 先唤醒屏保, 再走原来的 Advance 逻辑
+        // ★ 按键【不走宽限期】—— 人的手指不会"误触发", 按下就是要唤醒, 直接解锁。
+        if (g_display) {
+          g_display->ReleaseSleepLock();  // 内含 WakeUp, 解锁 + 唤醒一步到位
+        }
+        ai_vox::Engine::GetInstance().Advance();
+      },
+      nullptr));
+
+  g_display->ShowStatus("AI引擎已启动");
+}
+
+void loop() {
+#ifdef PRINT_HEAP_INFO_INTERVAL
+  static uint32_t s_print_heap_info_time = 0;
+  if (s_print_heap_info_time == 0 || millis() - s_print_heap_info_time >= PRINT_HEAP_INFO_INTERVAL) {
+    s_print_heap_info_time = millis();
+    PrintMemInfo();
+  }
+#endif
+
+  // 呼吸灯效果刷新(仅在 breath 模式下真正动作, 其它模式直接返回)
+  LedBreathUpdate();
+  // 彩虹流水灯效果刷新(仅在 rainbow 模式下真正动作)
+  LedRainbowUpdate();
+  // 单点跑马灯效果刷新(仅在 chase 模式下真正动作)
+  LedChaseUpdate();
+
+  // ★ 2026-10-14 二次修正: 【已删除】这里原来的"每 5 秒补发清灯帧"兜底。
+  //   删除理由:
+  //     · 该兜底是为了对付"上电伪数据残留", 但后来查明故障的真因是我自己在
+  //       InitWs2812() 里加的 pinMode() 毛刺(已删除), 不是残留 —— 兜底治错了病。
+  //     · 灯处于 off 时本来就该【什么都不做】, 让 IO38 静止。周期性重发帧反而是
+  //       一种"持续活动", 在长线上可能被邻近走线耦合, 弊大于利。
+  //     · 若真需要清灯, 语音指令 LedSetMode(kOff) 已经会调用 LedShowOff()。
+
+  // 屏保调度: 闲置满 30s 自动显示时钟; 期间也会驱动时钟每秒走字
+  //   - 内部会判断 kind_==kChat 与是否已进入屏保, 非聊天屏/非屏保态几乎零开销
+  //   - 唤醒靠 ShowStatus/SetChatMessage/SetEmotion 内部的 WakeUp(), 无需在此写事件分支
+  g_display->ScreenSaverTick();
+
+  // 环境传感器轮询: 内部 3 秒节流, 不到点直接返回(几乎零开销)
+  SensorPoll();
+
+  // 板间串口接收轮询: 非阻塞(while available 收字节), 有数据才处理, 空闲时几乎零开销
+  SerialLinkPoll();
+  ServoPoll();
+
+  // 把最新环境读数喂给屏保面板的温湿度行(2026-10-14 新增)。
+  // 放在 SensorPoll 之后: 保证读到的是本轮最新值。
+  // 内部会做"变化才刷"判断, 数据没变时零开销; 也不会 WakeUp 把用户踢出屏保。
+  if (g_display) {
+    g_display->SetEnvForScreenSaver(g_env_temp_c, g_env_hum, g_env_valid);
+  }
+
+  auto& engine = ai_vox::Engine::GetInstance();
+
+  const auto events = g_observer->PopEvents();
+
+  // ★ 语音链路耗时打点: 用于定位"说完话到舵机动"的延时到底在哪一段。
+  //   看串口日志: [T+...ms] 前缀就是每个事件到达的绝对毫秒数, 相减即得各段耗时。
+  //   预期耗时分布: kUser(识别出你说的话) -> MCP tools/call(云端模型决定调工具) 这段最长,
+  //   它就是"大模型思考"的时间, 改不了; 之后 MCP 事件到舵机动作是同一函数内同步执行, 耗时 ~0ms。
+  const uint32_t evt_now_ms = millis();
+
+  for (auto& event : events) {
+    if (auto text_received_event = std::get_if<ai_vox::TextReceivedEvent>(&event)) {
+      printf("[T+%lums] on text received: %s\n", (unsigned long)evt_now_ms, text_received_event->content.c_str());
+    } else if (auto activation_event = std::get_if<ai_vox::ActivationEvent>(&event)) {
+      printf("[T+%lums] activation code: %s, message: %s\n", (unsigned long)evt_now_ms,
+             activation_event->code.c_str(), activation_event->message.c_str());
+      g_display->ShowStatus("激活设备");
+      g_display->SetChatMessage(Display::Role::kSystem, activation_event->message);
+    } else if (auto state_changed_event = std::get_if<ai_vox::StateChangedEvent>(&event)) {
+      switch (state_changed_event->new_state) {
+        case ai_vox::ChatState::kIdle: {
+          printf("Idle\n");
+          break;
+        }
+        case ai_vox::ChatState::kInitted: {
+          printf("Initted\n");
+          g_display->ShowStatus("初始化完成");
+          break;
+        }
+        case ai_vox::ChatState::kLoading: {
+          printf("Loading...\n");
+          g_display->ShowStatus("加载协议中");
+          break;
+        }
+        case ai_vox::ChatState::kLoadingFailed: {
+          printf("Loading failed, please retry\n");
+          g_display->ShowStatus("加载协议失败，请重试");
+          break;
+        }
+        case ai_vox::ChatState::kStandby: {
+          printf("Standby\n");
+          g_display->ShowStatus("待命");
+          break;
+        }
+        case ai_vox::ChatState::kConnecting: {
+          printf("Connecting...\n");
+          g_display->ShowStatus("连接中...");
+          break;
+        }
+        case ai_vox::ChatState::kListening: {
+          printf("Listening...\n");
+          // ★★ 注意: 这里【不解除】语音睡觉锁。
+          //   踩过的坑(2026-10-14): 最初在这里调 ReleaseSleepLock(), 结果"待机"功能没用 ——
+          //   因为本固件是【连续对话】模式, AI 说完话后 AFE 会自动重新进入 kListening,
+          //   时间点在"待机工具调用"之后约 1 秒 → 锁刚上就被自己解开 → 屏保立刻被后续
+          //   的 SetChatMessage/ShowStatus 事件关掉。用户看到的就是"显示了一下又唤醒"。
+          //   kListening 只表示"麦克风开了", 不表示"用户说了新话", 不能作为解锁依据。
+          //   正确的解锁点是【用户真的说出新的一句话】(ChatMessageEvent/kUser), 见下方。
+          g_display->ShowStatus("聆听中");
+          break;
+        }
+        case ai_vox::ChatState::kSpeaking: {
+          printf("Speaking...\n");
+          g_display->ShowStatus("说话中");
+          break;
+        }
+        default: {
+          break;
+        }
+      }
+    } else if (auto emotion_event = std::get_if<ai_vox::EmotionEvent>(&event)) {
+      printf("emotion: %s\n", emotion_event->emotion.c_str());
+      g_display->SetEmotion(emotion_event->emotion);
+    } else if (auto chat_message_event = std::get_if<ai_vox::ChatMessageEvent>(&event)) {
+      switch (chat_message_event->role) {
+        case ai_vox::ChatRole::kAssistant: {
+          printf("[T+%lums] role: assistant, content: %s\n", (unsigned long)evt_now_ms,
+                 chat_message_event->content.c_str());
+          g_display->SetChatMessage(Display::Role::kAssistant, chat_message_event->content);
+          break;
+        }
+        case ai_vox::ChatRole::kUser: {
+          printf("[T+%lums] role: user, content: %s\n", (unsigned long)evt_now_ms,
+                 chat_message_event->content.c_str());
+          // ★★ 语音睡觉锁的正确解锁点(2026-10-14)。
+          //   这是"用户真的说出了新的一句话"的可靠信号 —— 覆盖了所有情况:
+          //     · 待机后重新叫"小智小智"+ 说新话
+          //     · 待机后直接说"亮屏"/"唤醒"(这句话会先到这里, 再触发 wake 工具)
+          //   时序保证: 发出"待机"这个指令的那句用户语音, 到达时间【早于】工具调用,
+          //     所以此刻锁还没上, 不会误放行"待机"自身。若万一乱序晚到,
+          //     CanReleaseSleepLock() 的宽限期会挡住。
+          if (g_display && g_display->CanReleaseSleepLock()) {
+            printf("[sleep-lock] user spoke again -> releasing\n");
+            g_display->ReleaseSleepLock();
+          }
+          g_display->SetChatMessage(Display::Role::kUser, chat_message_event->content.c_str());
+          break;
+        }
+      }
+    } else if (auto mcp_tool_call_event = std::get_if<ai_vox::McpToolCallEvent>(&event)) {
+      printf("[T+%lums] on mcp tool call: %s\n", (unsigned long)evt_now_ms,
+             mcp_tool_call_event->ToString().c_str());
+
+      if ("self.audio_speaker.set_volume" == mcp_tool_call_event->name) {
+        const auto volume_ptr = mcp_tool_call_event->param<int64_t>("volume");
+        if (volume_ptr != nullptr) {
+          printf("on mcp tool call: self.audio_speaker.set_volume, volume: %" PRId64 "\n", *volume_ptr);
+          g_audio_output_device->set_volume(*volume_ptr);
+          engine.SendMcpCallResponse(mcp_tool_call_event->id, true);
+        } else {
+          engine.SendMcpCallError(mcp_tool_call_event->id, "Missing valid argument: volume");
+        }
+      } else if ("self.audio_speaker.get_volume" == mcp_tool_call_event->name) {
+        const auto volume = g_audio_output_device->volume();
+        printf("on mcp tool call: self.audio_speaker.get_volume, volume: %" PRIu16 "\n", volume);
+        engine.SendMcpCallResponse(mcp_tool_call_event->id, volume);
+      } else if ("self.led.set" == mcp_tool_call_event->name) {
+        const auto mode_ptr = mcp_tool_call_event->param<std::string>("mode");
+        if (mode_ptr != nullptr) {
+          printf("on mcp tool call: self.led.set, mode: %s\n", mode_ptr->c_str());
+          if (*mode_ptr == "white") {
+            LedSetMode(LedMode::kWhite);
+          } else if (*mode_ptr == "breath") {
+            LedSetMode(LedMode::kBreath);
+          } else if (*mode_ptr == "rainbow") {
+            LedSetMode(LedMode::kRainbow);
+          } else if (*mode_ptr == "chase") {
+            LedSetMode(LedMode::kChase);
+          } else if (*mode_ptr == "off") {
+            LedSetMode(LedMode::kOff);
+          } else {
+            printf("[LED] unknown mode: %s, fallback to white\n", mode_ptr->c_str());
+            LedSetMode(LedMode::kWhite);
+          }
+          engine.SendMcpCallResponse(mcp_tool_call_event->id, true);
+        } else {
+          engine.SendMcpCallError(mcp_tool_call_event->id, "Missing valid argument: mode");
+        }
+      } else if ("self.led.pick" == mcp_tool_call_event->name) {
+        const auto leds_ptr = mcp_tool_call_event->param<std::string>("leds");
+        if (leds_ptr == nullptr) {
+          engine.SendMcpCallError(mcp_tool_call_event->id, "Missing valid argument: leds");
+        } else {
+          // 解析 "3,6,8" 这种列表: 逐个取数字, 只接受 1~8, 越界忽略(不报错, 保证语音指令容错)
+          uint8_t mask = 0x00;
+          const char* p = leds_ptr->c_str();
+          while (*p != '\0') {
+            if (*p >= '0' && *p <= '9') {
+              int num = 0;
+              while (*p >= '0' && *p <= '9') {
+                num = num * 10 + (*p - '0');
+                ++p;
+                if (num > 999) {  // 防超长数字溢出, 与越界同样处理
+                  break;
+                }
+              }
+              if (num >= 1 && num <= static_cast<int>(kWs2812Count)) {
+                mask |= static_cast<uint8_t>(1u << (num - 1));
+              } else {
+                printf("[LED] pick: ignore out-of-range led number %d\n", num);
+              }
+            } else {
+              ++p;  // 跳过逗号/空格等分隔符
+            }
+          }
+          g_led_pick_mask = mask;
+          LedSetMode(LedMode::kCustom);
+
+          // 回执文本: 列出真正点亮的灯号, 让 AI 能如实复述
+          char ack[128] = {0};
+          if (mask == 0x00) {
+            snprintf(ack, sizeof(ack), "已关闭全部灯");
+          } else {
+            int written = snprintf(ack, sizeof(ack), "已点亮第");
+            for (uint32_t i = 0; i < kWs2812Count && written > 0 && written < (int)sizeof(ack); ++i) {
+              if ((mask >> i) & 0x01) {
+                written += snprintf(ack + written, sizeof(ack) - written, "%u ", (unsigned)(i + 1));
+              }
+            }
+            snprintf(ack + (written < (int)sizeof(ack) ? written : (int)sizeof(ack) - 1),
+                     sizeof(ack) - (written < (int)sizeof(ack) ? written : (int)sizeof(ack) - 1), "颗灯");
+          }
+          printf("[T+%lums] on mcp tool call: self.led.pick, leds='%s' -> mask=0x%02X\n",
+                 (unsigned long)millis(), leds_ptr->c_str(), (unsigned)mask);
+          engine.SendMcpCallResponse(mcp_tool_call_event->id, std::string(ack));
+        }
+      } else if ("self.led.get" == mcp_tool_call_event->name) {
+        printf("on mcp tool call: self.led.get, mode: %s\n", LedModeName(g_led_mode));
+        engine.SendMcpCallResponse(mcp_tool_call_event->id, std::string(LedModeName(g_led_mode)));
+      } else if ("self.sensor.get_environment" == mcp_tool_call_event->name) {
+        // 环境传感器综合查询: 返回最近一次轮询的缓存(最多 3 秒旧), 无需现场重读
+        // (AHT20 一次测量要 ~80ms, 在 MCP 回调里现场读会拖慢响应)
+        if (!g_env_valid) {
+          engine.SendMcpCallError(mcp_tool_call_event->id, "环境传感器未连接或尚未完成首次读数");
+        } else {
+          char env_buf[96] = {0};
+          if (g_aht_ok && g_bmp_ok) {
+            snprintf(env_buf, sizeof(env_buf), "温度 %.1f°C, 湿度 %.0f%%, 气压 %.1f hPa",
+                     g_env_temp_c, g_env_hum, g_env_press_hpa);
+          } else if (g_aht_ok) {
+            snprintf(env_buf, sizeof(env_buf), "温度 %.1f°C, 湿度 %.0f%%", g_env_temp_c, g_env_hum);
+          } else {
+            snprintf(env_buf, sizeof(env_buf), "气压 %.1f hPa", g_env_press_hpa);
+          }
+          printf("on mcp tool call: self.sensor.get_environment -> %s\n", env_buf);
+          engine.SendMcpCallResponse(mcp_tool_call_event->id, std::string(env_buf));
+        }
+      } else if ("self.sensor.get_temperature" == mcp_tool_call_event->name) {
+        // 单项: 温度 (读缓存)
+        if (!g_env_valid || !g_aht_ok) {
+          engine.SendMcpCallError(mcp_tool_call_event->id, "温度传感器未连接或尚未完成首次读数");
+        } else {
+          char buf[48] = {0};
+          snprintf(buf, sizeof(buf), "%.1f 摄氏度", g_env_temp_c);
+          printf("on mcp tool call: self.sensor.get_temperature -> %s\n", buf);
+          engine.SendMcpCallResponse(mcp_tool_call_event->id, std::string(buf));
+        }
+      } else if ("self.sensor.get_humidity" == mcp_tool_call_event->name) {
+        // 单项: 湿度 (读缓存)
+        if (!g_env_valid || !g_aht_ok) {
+          engine.SendMcpCallError(mcp_tool_call_event->id, "湿度传感器未连接或尚未完成首次读数");
+        } else {
+          char buf[48] = {0};
+          snprintf(buf, sizeof(buf), "%.0f%%", g_env_hum);
+          printf("on mcp tool call: self.sensor.get_humidity -> %s\n", buf);
+          engine.SendMcpCallResponse(mcp_tool_call_event->id, std::string(buf));
+        }
+      } else if ("self.sensor.get_pressure" == mcp_tool_call_event->name) {
+        // 单项: 气压 (读缓存)
+        if (!g_env_valid || !g_bmp_ok) {
+          engine.SendMcpCallError(mcp_tool_call_event->id, "气压传感器未连接或尚未完成首次读数");
+        } else {
+          char buf[48] = {0};
+          snprintf(buf, sizeof(buf), "%.1f 百帕", g_env_press_hpa);
+          printf("on mcp tool call: self.sensor.get_pressure -> %s\n", buf);
+          engine.SendMcpCallResponse(mcp_tool_call_event->id, std::string(buf));
+        }
+      } else if ("self.display.sleep" == mcp_tool_call_event->name) {
+        // 语音进屏保: 立刻显示大时钟屏保, 并上"睡觉锁"防止 AI 随后的回复语音把它吵醒。
+        // ★ 先发响应再进屏保: SendMcpCallResponse 只是把结果交回云端, 不阻塞;
+        //   进屏保是纯本地 UI 动作。顺序无强依赖, 但先回响应语义更清晰。
+        printf("on mcp tool call: self.display.sleep -> entering screen saver\n");
+        engine.SendMcpCallResponse(mcp_tool_call_event->id, std::string("已进入待机屏保"));
+        if (g_display) {
+          g_display->EnterScreenSaver();
+        }
+      } else if ("self.display.wake" == mcp_tool_call_event->name) {
+        // 语音出屏保: 解除睡觉锁并唤醒(正常界面)。
+        printf("on mcp tool call: self.display.wake -> waking up\n");
+        engine.SendMcpCallResponse(mcp_tool_call_event->id, std::string("已唤醒屏幕"));
+        if (g_display) {
+          g_display->ReleaseSleepLock();  // 清锁 + WakeUp, 一步到位
+        }
+      } else if ("self.serial.send" == mcp_tool_call_event->name) {
+        // 向另一块板发一行文本(行协议, 自动补 '\n')
+        const auto text_ptr = mcp_tool_call_event->param<std::string>("text");
+        if (text_ptr == nullptr) {
+          engine.SendMcpCallError(mcp_tool_call_event->id, "Missing valid argument: text");
+        } else {
+          LinkSendLine(text_ptr->c_str());
+          char ack[96] = {0};
+          snprintf(ack, sizeof(ack), "已通过串口发出: %s", text_ptr->c_str());
+          engine.SendMcpCallResponse(mcp_tool_call_event->id, std::string(ack));
+        }
+      } else if ("self.serial.get_last" == mcp_tool_call_event->name) {
+        // 返回最近收到的完整一行
+        if (!g_link_has_line) {
+          engine.SendMcpCallError(mcp_tool_call_event->id, "尚未收到另一块板发来的数据");
+        } else {
+          printf("on mcp tool call: self.serial.get_last -> %s\n", g_link_last_line);
+          engine.SendMcpCallResponse(mcp_tool_call_event->id, std::string(g_link_last_line));
+        }
+      } else if ("self.servo.set" == mcp_tool_call_event->name) {
+        const auto servo_ptr = mcp_tool_call_event->param<int64_t>("servo");
+        const auto angle_ptr = mcp_tool_call_event->param<int64_t>("angle");
+        if (servo_ptr == nullptr || angle_ptr == nullptr) {
+          engine.SendMcpCallError(mcp_tool_call_event->id, "Missing valid argument: servo / angle");
+        } else {
+          const int idx = static_cast<int>(*servo_ptr) - 1;
+          int angle = static_cast<int>(*angle_ptr);
+          if (idx < 0 || idx >= 3) {
+            engine.SendMcpCallError(mcp_tool_call_event->id, "servo must be 1~3");
+          } else if (angle < 0 || angle > 180) {
+            engine.SendMcpCallError(mcp_tool_call_event->id, "angle must be 0~180");
+          } else {
+            g_servos[idx].testing = false;  // 新指令取消该舵机正在进行的自检
+            ServoWriteAngle(idx, angle);
+            printf("[T+%lums] on mcp tool call: self.servo.set -> servo%d IO%d to %d deg\n",
+                   (unsigned long)millis(), idx + 1, static_cast<int>(kServoPins[idx]), angle);
+            char ack[96] = {0};
+            snprintf(ack, sizeof(ack), "舵机%d 已转到 %d 度", idx + 1, angle);
+            engine.SendMcpCallResponse(mcp_tool_call_event->id, std::string(ack));
+          }
+        }
+      } else if ("self.servo.selftest" == mcp_tool_call_event->name) {
+        const auto servo_ptr = mcp_tool_call_event->param<int64_t>("servo");
+        if (servo_ptr == nullptr) {
+          engine.SendMcpCallError(mcp_tool_call_event->id, "Missing valid argument: servo");
+        } else {
+          const int idx = static_cast<int>(*servo_ptr) - 1;
+          if (idx < 0 || idx >= 3) {
+            engine.SendMcpCallError(mcp_tool_call_event->id, "servo must be 1~3");
+          } else {
+            ServoStartSelftest(idx);
+            printf("[T+%lums] on mcp tool call: self.servo.selftest -> servo%d IO%d\n",
+                   (unsigned long)millis(), idx + 1, static_cast<int>(kServoPins[idx]));
+            char ack[96] = {0};
+            snprintf(ack, sizeof(ack), "舵机%d 自检已开始", idx + 1);
+            engine.SendMcpCallResponse(mcp_tool_call_event->id, std::string(ack));
+          }
+        }
+      }
+    }
+  }
+}
